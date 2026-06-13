@@ -1,0 +1,12 @@
+{
+  "url": "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=YOUR_BUILD_LABEL&hl=en-US&_reqid=123456&rt=c",
+  "headers": {
+    "accept": "*/*",
+    "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    "cookie": "PASTE_YOUR_CAPTURED_COOKIE_HERE",
+    "origin": "https://gemini.google.com",
+    "referer": "https://gemini.google.com/",
+    "user-agent": "PASTE_THE_USER_AGENT_FROM_YOUR_CAPTURE"
+  },
+  "post_data": "PASTE_THE_CAPTURED_FORM_ENCODED_POST_DATA_HERE"
+}
