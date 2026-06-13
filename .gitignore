@@ -3,4 +3,3 @@ obj/
 .vs/
 *.user
 *.suo
-Config/gemini_request.json

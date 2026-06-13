@@ -1,0 +1,28 @@
+{
+    "url": "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260324.01_p0&f.sid=8477920910441249606&hl=en-US&_reqid=2208378&rt=c",
+    "headers": {
+        "accept": "*/*",
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "cookie": "",
+        "origin": "https://gemini.google.com",
+        "referer": "https://gemini.google.com/",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "x-same-domain": "1",
+        "sec-ch-ua": "\"Chromium\";v=\"145\", \"Not:A-Brand\";v=\"99\"",
+        "sec-ch-ua-arch": "\"x86\"",
+        "sec-ch-ua-bitness": "\"64\"",
+        "sec-ch-ua-form-factors": "\"Desktop\"",
+        "sec-ch-ua-full-version": "\"145.0.7632.6\"",
+        "sec-ch-ua-full-version-list": "\"Chromium\";v=\"145.0.7632.6\", \"Not:A-Brand\";v=\"99.0.0.0\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": "\"\"",
+        "sec-ch-ua-platform": "\"Linux\"",
+        "sec-ch-ua-platform-version": "\"\"",
+        "sec-ch-ua-wow64": "?0",
+        "x-goog-ext-525001261-jspb": "[1,null,null,null,\"fbb127bbb056c959\",null,null,0,[4],null,null,1]",
+        "x-goog-ext-525005358-jspb": "[\"47868A8E-7A59-4A72-B36F-E02B72D61BD1\",1]",
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0]"
+    },
+    "post_data": "f.req=%5Bnull%2C%22%5B%5B%5C%22hi%5C%22%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2C0%5D%2C%5B%5C%22en-US%5C%22%5D%2C%5B%5C%22%5C%22%2C%5C%22%5C%22%2C%5C%22%5C%22%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5C%22%5C%22%5D%2C%5C%22!7O-l74vNAAbUw4bn9MNC4AIwrNm6xRo7AEABEArZ1O65MUv54JeZDi1zIgLWFmtIy5dAggBXINKw7EBVxZByoQKNVriIQi5TKJwTiIXNefgp7zfT8kosw8LXAgAAAKZSAAAABGgBB34AQdcwutCRTsSuMsOFif2Qi2dVCM7vMhmUdbk76_5H15MlJ4MRsoYbe8Jrg1QCkVxVRjw_9Z7f4tpvBz1rvSz3yFe8mQNj-5FhONxW63R3xELN1WT6e_Id_JLRNuVd6W3L_-DTb6l2lMXe14fI0Tp6rKg-SAZ_jgyQLoK4wMQ1LNqP4xFRg7UqrxM7tb0im0VKj1n_VcY5ZmtfL6vB8vlYfmemsnTMzE_fFDciY19jnRHHzI-6R80qxJepPXIb9qxwkbQVPjynIVQe4e016n9KTvcQLbKMGFBztolgN0zVijzl1Eu6J7jSTbm0ASIO-TwdUojMMLUl63MtsA8ftS9ewU4foDIpS0cwQokd7WICWeLURpoaK0tvU0heEKrq3NexoMbrQv0i0YN4bQjS8ykyImQozQDTqAHlsNlmA6lz1i66IWQFzL58FN5Ct93Rk9QDzUtFubtrgGKCkOU9p5-2mWIOAp2demJakWXars86u69NSzq0_Yp44e9BY6MByi6kTMQaMmF3_znF-PlodHxXDDXohzwOILKJAeJyX1Fs91l4N60XXhDHMTg1Fe_0kGLZfZYN09flW3U8m56xcKneA6H4suo-ixzLDggBIbJ8ZAahqD9Rnk7OhH2-QBJPts9bIGDTzCFHXwxnkTHNx5b-rIweYpATymlLEZeH6VAx4j_a1cYjrtlb7NVV0X8_rM-AHRyqaWTswrJ_6Wt5t3UpGhxREmk1f65Oj-S9xWaH3mLiOwfaLnqP8bedTfbo2Wvso4p3DWXTRSHkasDZZpl_bFbp3iOGgoTERaQGMekksBIKFiP9mYQgEC-Q4-D87ZbFoV2YZ_COt9RB1Blsf6MqmA5rhTUFZ7RaE7P-SEm1ILKnfjz29VppjQYebl7Reja1_y-Xw5hxWb4Qw8aBD_2leNSv4NMSm1dc4YyzbiKWXv2JpRffUawwY75GNz5Z1So2chX9fPP-DbE48u2YAFjXuvBlB_UgLYq8u1Zx8oRoePoG_PIxjzHWewFAVvFxyqlIrDSVJOEKBftWI3-A0dOhTF-QzB2uUzFnNI7DrvtPpaKHzCTlqgxGkQNJ_K3iINo6ZVqVo_gpHKMvHdrm7HAlSRJxQQtaGGc4oSoEojFb7yzWTfSI7V1hy8oVo1Cf-nG5oRXXsBbSB9L1L4OoA2DagJDmEtUD1Xz6sKNQ2VYcwBngFOG_fiC7hMPY_-JtSqyPCarxQ7Ijl293x-vxfXKnjvSc0a-nsU14%5C%22%2C%5C%22c49eb2d009a01e6f06edf592bcca6377%5C%22%2Cnull%2C%5B0%5D%2C1%2Cnull%2Cnull%2C1%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5B%5B0%5D%5D%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C1%2Cnull%2Cnull%2C%5B4%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5B2%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C0%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C%5C%2247868A8E-7A59-4A72-B36F-E02B72D61BD1%5C%22%2Cnull%2C%5B%5D%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2Cnull%2C1%5D%22%5D&"
+}
