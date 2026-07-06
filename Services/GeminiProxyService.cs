@@ -17,8 +17,8 @@ public sealed class GeminiProxyService
     private readonly GeminiProxyOptions _options;
     private readonly SemaphoreSlim _configLock = new(1, 1);
 
-    private GeminiRequestConfig? _cachedConfig;
-    private DateTime _cachedConfigWriteTimeUtc;
+    private readonly Dictionary<string, CachedGeminiConfig> _cachedConfigs =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public GeminiProxyService(HttpClient httpClient, IOptions<GeminiProxyOptions> options)
     {
@@ -28,13 +28,21 @@ public sealed class GeminiProxyService
 
     public async Task<string> AskAsync(string prompt, CancellationToken cancellationToken = default)
     {
+        return await AskAsync(prompt, requestConfigPath: null, cancellationToken);
+    }
+
+    public async Task<string> AskAsync(
+        string prompt,
+        string? requestConfigPath,
+        CancellationToken cancellationToken = default)
+    {
         var normalizedPrompt = (prompt ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(normalizedPrompt))
         {
             throw new ArgumentException("Prompt is required.", nameof(prompt));
         }
 
-        var config = await LoadConfigAsync(cancellationToken);
+        var config = await LoadConfigAsync(requestConfigPath, cancellationToken);
         var request = BuildRequest(config, normalizedPrompt);
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -47,30 +55,40 @@ public sealed class GeminiProxyService
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"Gemini request failed with status {(int)response.StatusCode}");
+            var responseExcerpt = await response.Content.ReadAsStringAsync(timeoutCts.Token);
+            responseExcerpt = responseExcerpt.Length > 240
+                ? responseExcerpt[..240]
+                : responseExcerpt;
+
+            throw new HttpRequestException(
+                $"Gemini request failed with status {(int)response.StatusCode}: {responseExcerpt}");
         }
 
         var responseText = await response.Content.ReadAsStringAsync(timeoutCts.Token);
         return ParseGeminiText(responseText);
     }
 
-    private async Task<GeminiRequestConfig> LoadConfigAsync(CancellationToken cancellationToken)
+    private async Task<GeminiRequestConfig> LoadConfigAsync(
+        string? requestConfigPath,
+        CancellationToken cancellationToken)
     {
-        var configPath = ResolveConfigPath();
+        var configPath = ResolveConfigPath(requestConfigPath);
         var writeTimeUtc = File.GetLastWriteTimeUtc(configPath);
 
-        if (_cachedConfig is not null && writeTimeUtc == _cachedConfigWriteTimeUtc)
+        if (_cachedConfigs.TryGetValue(configPath, out var cachedConfig) &&
+            cachedConfig.WriteTimeUtc == writeTimeUtc)
         {
-            return _cachedConfig;
+            return cachedConfig.Config;
         }
 
         await _configLock.WaitAsync(cancellationToken);
         try
         {
             writeTimeUtc = File.GetLastWriteTimeUtc(configPath);
-            if (_cachedConfig is not null && writeTimeUtc == _cachedConfigWriteTimeUtc)
+            if (_cachedConfigs.TryGetValue(configPath, out cachedConfig) &&
+                cachedConfig.WriteTimeUtc == writeTimeUtc)
             {
-                return _cachedConfig;
+                return cachedConfig.Config;
             }
 
             var raw = await File.ReadAllTextAsync(configPath, cancellationToken);
@@ -79,8 +97,7 @@ public sealed class GeminiProxyService
 
             ValidateConfig(config, configPath);
 
-            _cachedConfig = config;
-            _cachedConfigWriteTimeUtc = writeTimeUtc;
+            _cachedConfigs[configPath] = new CachedGeminiConfig(config, writeTimeUtc);
             return config;
         }
         finally
@@ -89,14 +106,18 @@ public sealed class GeminiProxyService
         }
     }
 
-    private string ResolveConfigPath()
+    private string ResolveConfigPath(string? requestConfigPath)
     {
-        if (string.IsNullOrWhiteSpace(_options.RequestConfigPath))
+        var configuredPath = string.IsNullOrWhiteSpace(requestConfigPath)
+            ? _options.RequestConfigPath
+            : requestConfigPath;
+
+        if (string.IsNullOrWhiteSpace(configuredPath))
         {
             throw new InvalidOperationException("GeminiProxy:RequestConfigPath is not configured.");
         }
 
-        var fullPath = Path.GetFullPath(_options.RequestConfigPath);
+        var fullPath = Path.GetFullPath(configuredPath);
         if (!File.Exists(fullPath))
         {
             throw new FileNotFoundException("gemini_request.json was not found.", fullPath);
@@ -351,4 +372,6 @@ public sealed class GeminiProxyService
     {
         return Uri.EscapeDataString(value).Replace("%20", "+", StringComparison.Ordinal);
     }
+
+    private sealed record CachedGeminiConfig(GeminiRequestConfig Config, DateTime WriteTimeUtc);
 }

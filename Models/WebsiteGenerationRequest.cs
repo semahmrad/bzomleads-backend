@@ -1,0 +1,26 @@
+namespace Backend.Models;
+
+public sealed record WebsiteGenerationRequest(
+    string PlaceId,
+    string BusinessName,
+    string BusinessCategory,
+    string? PrimaryType,
+    string? Description,
+    string? Address,
+    string? PhoneNumber,
+    string? WhatsappNumber,
+    string? WebsiteUri,
+    string? GoogleMapsUri,
+    double? Latitude,
+    double? Longitude,
+    double? Rating,
+    int? ReviewCount,
+    string? ReviewsSummary,
+    IReadOnlyList<string>? EmailAddresses,
+    IReadOnlyList<string>? OpeningHours,
+    IReadOnlyList<string>? Services,
+    IReadOnlyList<string>? Features,
+    IReadOnlyList<string>? PhotoUris,
+    string? LogoUri,
+    IReadOnlyDictionary<string, string>? SocialLinks,
+    IReadOnlyList<string>? Languages);

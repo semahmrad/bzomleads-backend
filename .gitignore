@@ -3,3 +3,8 @@ obj/
 .vs/
 *.user
 *.suo
+App_Data/
+*.out.log
+*.err.log
+*.stdout.log
+*.stderr.log
