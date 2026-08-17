@@ -25,7 +25,18 @@ body {
   background: var(--color-cream);
   color: var(--color-text-dark);
   line-height: 1.6;
+  letter-spacing: -0.005em;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
 }
 
 body[data-splash='open'],

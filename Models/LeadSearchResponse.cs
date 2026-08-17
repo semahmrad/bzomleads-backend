@@ -34,3 +34,19 @@ public sealed record LeadSearchResultItem(
     IReadOnlyList<string> EmailAddresses,
     IReadOnlyList<string> ContactPhoneNumbers,
     IReadOnlyList<string> ContactPageUris);
+
+public sealed record LeadStreamMessage(
+    string Type,
+    LeadSearchResponseSummary? Summary = null,
+    LeadSearchResultItem? Lead = null,
+    string? ErrorMessage = null,
+    IReadOnlyList<LeadSearchResultItem>? Leads = null);
+
+public sealed record LeadSearchResponseSummary(
+    int Total,
+    int ExistingResultsCount,
+    int NewResultsCount,
+    int RequestedNewResults,
+    int WithWebsiteCount,
+    int WithoutWebsiteCount,
+    int EmailCount);

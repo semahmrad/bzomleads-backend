@@ -28,7 +28,16 @@ internal static class LeadSearchCatalog
                 OverpassFilter: "[\"shop\"=\"bakery\"]"),
             ["beauty_salon"] = new(
                 Label: "Salon beaute",
-                OverpassFilter: "[\"shop\"~\"^(beauty|hairdresser|cosmetics)$\"]")
+                OverpassFilter: "[\"shop\"~\"^(beauty|hairdresser|cosmetics)$\"]"),
+            ["car_repair"] = new(
+                Label: "Garage / Mécanicien",
+                OverpassFilter: "[\"shop\"=\"car_repair\"]"),
+            ["medical_office"] = new(
+                Label: "Cabinet médical / Dentiste",
+                OverpassFilter: "[\"amenity\"~\"^(doctors|dentist|clinic)$\"]"),
+            ["hotel"] = new(
+                Label: "Hôtel / Hébergement",
+                OverpassFilter: "[\"tourism\"~\"^(hotel|guest_house|hostel)$\"]")
         };
 
     public static string NormalizeProvider(string? provider)

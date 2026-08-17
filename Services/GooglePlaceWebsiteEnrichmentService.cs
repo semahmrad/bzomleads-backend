@@ -172,7 +172,6 @@ public sealed class GooglePlaceWebsiteEnrichmentService
                 "rating",
                 "userRatingCount",
                 "currentOpeningHours.weekdayDescriptions",
-                "reviewSummary",
                 "reviews",
                 "editorialSummary",
                 "photos",

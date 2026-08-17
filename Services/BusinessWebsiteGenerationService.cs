@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Backend.Generation;
 using Backend.Models;
 
 namespace Backend.Services;
@@ -75,13 +76,6 @@ public sealed class BusinessWebsiteGenerationService
     private static readonly Regex Base64LikePayloadRegex = new(
         "^[A-Za-z0-9+/=_-]{64,}$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-    private static readonly IReadOnlyList<ModelCandidate> ModelPriority =
-    [
-        new ModelCandidate("Gemma 4 31B", ["Config/gemma4_31b_request.json", "Config/gemma4-31b_request.json"]),
-        new ModelCandidate("Gemma 4 27B", ["Config/gemma4_27b_request.json", "Config/gemma4-27b_request.json"]),
-        new ModelCandidate("Gemini Flash", ["Config/gemini_flash_request.json", "Config/gemini_request.json"])
-    ];
 
     private static readonly IReadOnlyList<TemplateDefinition> TemplateDefinitions =
     [
@@ -220,16 +214,16 @@ public sealed class BusinessWebsiteGenerationService
         new PaletteDefinition(
             "sand-terracotta",
             false,
-            "#bb5b36",
-            "#81452d",
-            "#e8b172",
-            "#f7f0e9",
-            "#fffdfb",
-            "#f0e2d7",
-            "#2d170f",
-            "rgba(83, 49, 33, 0.76)",
-            "rgba(182, 131, 96, 0.2)",
-            "#fff8f3",
+            "#8f3f36",
+            "#5f302b",
+            "#c89b5b",
+            "#f8f4ed",
+            "#fffefb",
+            "#eee5da",
+            "#241a17",
+            "rgba(66, 48, 42, 0.74)",
+            "rgba(143, 63, 54, 0.16)",
+            "#fffaf5",
             ["warm-terra", "restaurant", "bakery", "cafe"]),
         new PaletteDefinition(
             "coastal-indigo",
@@ -292,17 +286,20 @@ public sealed class BusinessWebsiteGenerationService
     private readonly HttpClient _httpClient;
     private readonly GeminiProxyService _geminiProxyService;
     private readonly GooglePlaceWebsiteEnrichmentService _googlePlaceWebsiteEnrichmentService;
+    private readonly GoogleMapsPublicLeadEnrichmentService _googleMapsPublicLeadEnrichmentService;
     private readonly IHostEnvironment _environment;
 
     public BusinessWebsiteGenerationService(
         HttpClient httpClient,
         GeminiProxyService geminiProxyService,
         GooglePlaceWebsiteEnrichmentService googlePlaceWebsiteEnrichmentService,
+        GoogleMapsPublicLeadEnrichmentService googleMapsPublicLeadEnrichmentService,
         IHostEnvironment environment)
     {
         _httpClient = httpClient;
         _geminiProxyService = geminiProxyService;
         _googlePlaceWebsiteEnrichmentService = googlePlaceWebsiteEnrichmentService;
+        _googleMapsPublicLeadEnrichmentService = googleMapsPublicLeadEnrichmentService;
         _environment = environment;
         _httpClient.Timeout = TimeSpan.FromSeconds(20);
     }
@@ -316,13 +313,32 @@ public sealed class BusinessWebsiteGenerationService
         CancellationToken cancellationToken = default)
     {
         var enrichment = await _googlePlaceWebsiteEnrichmentService.TryEnrichAsync(request, cancellationToken);
+        GoogleMapsPublicLeadEnrichmentService.PublicLeadEnrichment? publicGoogleEnrichment = null;
+        if (enrichment?.Rating is null || enrichment.ReviewHighlights.Count == 0)
+        {
+            publicGoogleEnrichment = await _googleMapsPublicLeadEnrichmentService.TryEnrichAsync(
+                request.BusinessName,
+                enrichment?.GoogleMapsUri ?? request.GoogleMapsUri,
+                enrichment?.Latitude ?? request.Latitude,
+                enrichment?.Longitude ?? request.Longitude,
+                request.Address,
+                cancellationToken,
+                includeReviews: true);
+        }
+
         var business = await EnrichBusinessVisualsAsync(
-            NormalizeRequest(request, enrichment),
+            NormalizeRequest(request, enrichment, publicGoogleEnrichment),
             cancellationToken);
         var template = SelectTemplateDefinition(history, business, preferredTemplateId: null);
         var designConcept = BuildDesignConcept(template, business);
         var theme = BuildTheme(template, business, designConcept.ColorMood, designConcept.FontDirection);
-        var contentBundle = await BuildContentBundleAsync(business, cancellationToken);
+        var contentBundle = await BuildContentBundleAsync(
+            business,
+            template,
+            theme,
+            designConcept.DefaultSectionOrder,
+            designConcept.MotionStyle,
+            cancellationToken);
         var mediaAssets = await PrepareImageAssetsAsync(
             business,
             contentBundle.FallbackFrench.GalleryCaptions,
@@ -942,31 +958,23 @@ public sealed class BusinessWebsiteGenerationService
     {
         var editPrompt = BuildEditPrompt(state, prompt, uploadedImages, uploadedLogo);
 
-        foreach (var candidate in ModelPriority)
+        try
         {
-            var configPath = ResolveFirstExistingConfigPath(candidate.ConfigPaths);
-            if (configPath is null)
+            var responseText = await _geminiProxyService.AskAsync(editPrompt, cancellationToken);
+            var payload = TryParseAiEditPayload(responseText);
+            if (payload is not null)
             {
-                continue;
+                var model = await _geminiProxyService.GetConfiguredModelAsync(cancellationToken);
+                return new AiEditPayloadResult(model, payload);
             }
-
-            try
-            {
-                var responseText = await _geminiProxyService.AskAsync(editPrompt, configPath, cancellationToken);
-                var payload = TryParseAiEditPayload(responseText);
-                if (payload is not null)
-                {
-                    return new AiEditPayloadResult(candidate.Name, payload);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-                // Fall through to the next model candidate.
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Keep the deterministic editor available if the account model is unavailable.
         }
 
         return null;
@@ -978,6 +986,31 @@ public sealed class BusinessWebsiteGenerationService
         IReadOnlyList<WebsiteUploadedAsset> uploadedImages,
         WebsiteUploadedAsset? uploadedLogo)
     {
+        var creativeBrief = WebsiteGenerationCreativeDirection.BuildBrief(
+            state.Business.Category,
+            state.Business.PrimaryType,
+            state.TemplateId,
+            state.TemplateName,
+            state.ColorMood,
+            state.FontDirection,
+            state.MotionStyle,
+            state.Theme.FontPair.DisplayName,
+            state.Theme.FontPair.BodyName,
+            state.Theme.PrimaryColor,
+            state.Theme.SecondaryColor,
+            state.Theme.AccentColor,
+            state.Theme.Background,
+            state.Theme.Surface,
+            state.Theme.TextColor,
+            state.SectionOrder,
+            state.Business.Services.Count > 0
+                ? state.Business.Services
+                : state.Translations["fr"].Services.Select(static card => card.Title).ToList(),
+            state.Business.Features.Count > 0
+                ? state.Business.Features
+                : state.Translations["fr"].Highlights.Select(static card => card.Title).ToList(),
+            state.Business.Description);
+
         var promptPayload = JsonSerializer.Serialize(new
         {
             currentDesign = new
@@ -1036,6 +1069,10 @@ public sealed class BusinessWebsiteGenerationService
         return $$"""
         You are editing an existing generated static website.
         Return ONLY strict JSON. No markdown. No commentary.
+        Respect the current creative direction unless the user explicitly asks to change it.
+
+        Current creative direction:
+        {{creativeBrief}}
 
         Rules:
         - Change only the parts requested by the user.
@@ -1334,13 +1371,28 @@ public sealed class BusinessWebsiteGenerationService
 
     private async Task<LocalizedContentBundle> BuildContentBundleAsync(
         NormalizedBusiness business,
+        TemplateDefinition template,
+        ThemeChoice theme,
+        IReadOnlyList<string> sectionOrder,
+        string motionStyle,
         CancellationToken cancellationToken)
     {
         var fallbackTranslations = PolishTranslationsForPresentation(BuildFallbackTranslations(business), business);
         var fallbackFrench = fallbackTranslations["fr"];
         var fallbackSeo = BuildFallbackSeo(business, fallbackFrench);
+        var creativeBrief = BuildCreativeDirectionBrief(
+            business,
+            template,
+            theme,
+            sectionOrder,
+            motionStyle,
+            fallbackFrench);
 
-        var aiPayload = await TryGenerateAiPayloadAsync(business, fallbackFrench, cancellationToken);
+        var aiPayload = await TryGenerateAiPayloadAsync(
+            business,
+            fallbackFrench,
+            creativeBrief,
+            cancellationToken);
         if (aiPayload is null)
         {
             return new LocalizedContentBundle(
@@ -1363,41 +1415,31 @@ public sealed class BusinessWebsiteGenerationService
     private async Task<AiPayloadResult?> TryGenerateAiPayloadAsync(
         NormalizedBusiness business,
         LocalizedWebsiteContent fallbackFrench,
+        string creativeBrief,
         CancellationToken cancellationToken)
     {
-        var prompt = BuildAiPrompt(business, fallbackFrench);
+        var prompt = BuildAiPrompt(business, fallbackFrench, creativeBrief);
 
-        foreach (var candidate in ModelPriority)
+        try
         {
-            var configPath = ResolveFirstExistingConfigPath(candidate.ConfigPaths);
-            if (configPath is null)
+            var responseText = await _geminiProxyService.AskAsync(prompt, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(responseText))
             {
-                continue;
-            }
-
-            try
-            {
-                var responseText = await _geminiProxyService.AskAsync(prompt, configPath, cancellationToken);
-                if (string.IsNullOrWhiteSpace(responseText))
-                {
-                    continue;
-                }
-
                 var aiPayload = TryParseAiPayload(responseText);
                 if (aiPayload is not null)
                 {
-                    return new AiPayloadResult(candidate.Name, aiPayload);
+                    var model = await _geminiProxyService.GetConfiguredModelAsync(cancellationToken);
+                    return new AiPayloadResult(model, aiPayload);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-                // If a higher-priority model is unavailable, over quota, or returns an invalid
-                // payload, we automatically continue with the next configured model.
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Keep deterministic content generation available if Google AI is unavailable.
         }
 
         return null;
@@ -1631,7 +1673,44 @@ public sealed class BusinessWebsiteGenerationService
         return new SeoContent(title, description, keywords, frenchContent.HeroTitle);
     }
 
-    private string BuildAiPrompt(NormalizedBusiness business, LocalizedWebsiteContent fallbackFrench)
+    private string BuildCreativeDirectionBrief(
+        NormalizedBusiness business,
+        TemplateDefinition template,
+        ThemeChoice theme,
+        IReadOnlyList<string> sectionOrder,
+        string motionStyle,
+        LocalizedWebsiteContent fallbackFrench)
+    {
+        return WebsiteGenerationCreativeDirection.BuildBrief(
+            business.Category,
+            business.PrimaryType,
+            template.Id,
+            template.DisplayName,
+            ResolveDefaultColorMood(template.Id, business),
+            ResolveDefaultFontDirection(template.Id, business),
+            motionStyle,
+            theme.FontPair.DisplayName,
+            theme.FontPair.BodyName,
+            theme.PrimaryColor,
+            theme.SecondaryColor,
+            theme.AccentColor,
+            theme.Background,
+            theme.Surface,
+            theme.TextColor,
+            sectionOrder,
+            business.Services.Count > 0
+                ? business.Services
+                : fallbackFrench.Services.Select(static card => card.Title).ToList(),
+            business.Features.Count > 0
+                ? business.Features
+                : fallbackFrench.Highlights.Select(static card => card.Title).ToList(),
+            business.Description);
+    }
+
+    private string BuildAiPrompt(
+        NormalizedBusiness business,
+        LocalizedWebsiteContent fallbackFrench,
+        string creativeBrief)
     {
         var promptPayload = JsonSerializer.Serialize(new
         {
@@ -1674,6 +1753,12 @@ public sealed class BusinessWebsiteGenerationService
         return $$"""
         You are creating premium marketing copy for a static website generator.
         Return ONLY strict JSON. No markdown fences. No explanation.
+        You are not writing from a blank slate: the generator already selected a deliberate creative direction for this website.
+        The copy, captions, FAQ wording, and SEO choices must feel consistent with that direction rather than generic.
+
+        Creative direction:
+        {{creativeBrief}}
+
         Requirements:
         - Languages: fr, en, ar.
         - Tone: modern, polished, credible, conversion-oriented, local SEO friendly.
@@ -3654,10 +3739,10 @@ public sealed class BusinessWebsiteGenerationService
         {
             return $$"""
             <div class="quote-slide active">
-              <p>{{EscapeHtml(content.ReviewsSummary)}}</p>
+              <p>Consultez les avis authentiques publiés par les clients directement sur la fiche Google Maps.</p>
               <div class="quote-author">
-                <span class="quote-avatar">{{EscapeHtml(BuildInitials(business.Name))}}</span>
-                <div><h5>{{EscapeHtml(business.Name)}}</h5><span>Google Maps</span></div>
+                <span class="quote-avatar">G</span>
+                <div><h5>Avis vérifiés</h5><span>Source Google Maps</span></div>
               </div>
             </div>
             """;
@@ -3926,19 +4011,7 @@ public sealed class BusinessWebsiteGenerationService
     {
         if (business.ReviewHighlights.Count == 0)
         {
-            return $$"""
-            <article class="testimonial-card">
-              <div class="stars">{{BuildRatingStars(business.Rating)}}</div>
-              <p>{{EscapeHtml(content.ReviewsSummary)}}</p>
-              <div class="testimonial-author">
-                <span class="testimonial-avatar">{{EscapeHtml(BuildInitials(business.Name))}}</span>
-                <div>
-                  <h5>{{EscapeHtml(business.Name)}}</h5>
-                  <span>Google Maps</span>
-                </div>
-              </div>
-            </article>
-            """;
+            return string.Empty;
         }
 
         return string.Join(Environment.NewLine, business.ReviewHighlights
@@ -5153,13 +5226,13 @@ public sealed class BusinessWebsiteGenerationService
             };
         }
 
-        if (business.Rating is not null)
+        if (business.Rating is not null && business.ReviewCount is > 0)
         {
             schema["aggregateRating"] = new
             {
                 @type = "AggregateRating",
                 ratingValue = business.Rating.Value.ToString("0.0", CultureInfo.InvariantCulture),
-                reviewCount = business.ReviewCount ?? 1
+                reviewCount = business.ReviewCount.Value
             };
         }
 
@@ -6004,6 +6077,11 @@ public sealed class BusinessWebsiteGenerationService
 
     private FontPair SelectFontPair(string fontDirection, string templateId)
     {
+        if (templateId is "restaurant-signature" or "coffee-shop-signature")
+        {
+            return FontPairs.First(fontPair => fontPair.DisplayName == "Fraunces");
+        }
+
         var matchingPairs = FontPairs
             .Where(fontPair => fontDirection switch
             {
@@ -6263,7 +6341,8 @@ public sealed class BusinessWebsiteGenerationService
 
     private static NormalizedBusiness NormalizeRequest(
         WebsiteGenerationRequest request,
-        GooglePlaceWebsiteEnrichmentService.WebsiteGenerationEnrichment? enrichment)
+        GooglePlaceWebsiteEnrichmentService.WebsiteGenerationEnrichment? enrichment,
+        GoogleMapsPublicLeadEnrichmentService.PublicLeadEnrichment? publicGoogleEnrichment)
     {
         var businessName = CleanText(request.BusinessName);
         if (string.IsNullOrWhiteSpace(businessName))
@@ -6286,14 +6365,22 @@ public sealed class BusinessWebsiteGenerationService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var phoneNumber = CleanText(request.PhoneNumber) ?? CleanText(enrichment?.PhoneNumber);
-        var whatsappNumber = NormalizeWhatsappNumber(request.WhatsappNumber ?? request.PhoneNumber ?? enrichment?.PhoneNumber);
+        var phoneNumber = CleanText(enrichment?.PhoneNumber) ??
+                          CleanText(publicGoogleEnrichment?.PhoneNumber) ??
+                          CleanText(request.PhoneNumber);
+        var whatsappNumber = NormalizeWhatsappNumber(
+            enrichment?.PhoneNumber ??
+            publicGoogleEnrichment?.PhoneNumber ??
+            request.WhatsappNumber ??
+            request.PhoneNumber);
         var address = CleanText(request.Address);
         var googleMapsUri = TryGetAbsoluteHttpUri(enrichment?.GoogleMapsUri, out var enrichedMapsUri)
             ? enrichedMapsUri.ToString()
-            : TryGetAbsoluteHttpUri(request.GoogleMapsUri, out var mapsUri)
-                ? mapsUri.ToString()
-                : BuildGoogleMapsUri(latitude, longitude, address ?? businessName);
+            : TryGetAbsoluteHttpUri(publicGoogleEnrichment?.GoogleMapsUri, out var publicMapsUri)
+                ? publicMapsUri.ToString()
+                : TryGetAbsoluteHttpUri(request.GoogleMapsUri, out var mapsUri)
+                    ? mapsUri.ToString()
+                    : BuildGoogleMapsUri(latitude, longitude, address ?? businessName);
         var mapEmbedUri = BuildMapEmbedUri(latitude, longitude, address ?? businessName);
 
         var openingHours = NormalizeList((request.OpeningHours ?? []).Concat(enrichment?.OpeningHours ?? []).ToList());
@@ -6325,7 +6412,7 @@ public sealed class BusinessWebsiteGenerationService
                 entry => entry.Value.Trim(),
                 StringComparer.OrdinalIgnoreCase);
 
-        var reviewHighlights = (enrichment?.ReviewHighlights ?? [])
+        var officialReviewHighlights = (enrichment?.ReviewHighlights ?? [])
             .Select(review => new ReviewHighlight(
                 AuthorName: CleanText(review.AuthorName) ?? "Client Google",
                 Rating: review.Rating,
@@ -6333,8 +6420,22 @@ public sealed class BusinessWebsiteGenerationService
                 Text: CleanText(review.Text) ?? string.Empty,
                 GoogleMapsUri: TryGetAbsoluteHttpUri(review.GoogleMapsUri, out var reviewUri)
                     ? reviewUri.ToString()
-                    : null))
+                    : null));
+        var publicReviewHighlights = (publicGoogleEnrichment?.ReviewHighlights ?? [])
+            .Select(review => new ReviewHighlight(
+                AuthorName: CleanText(review.AuthorName) ?? "Client Google",
+                Rating: review.Rating,
+                RelativePublishTimeDescription: CleanText(review.RelativePublishTimeDescription),
+                Text: CleanText(review.Text) ?? string.Empty,
+                GoogleMapsUri: TryGetAbsoluteHttpUri(review.GoogleMapsUri, out var reviewUri)
+                    ? reviewUri.ToString()
+                    : publicGoogleEnrichment?.ReviewsUri));
+        var reviewHighlights = officialReviewHighlights
+            .Concat(publicReviewHighlights)
             .Where(static review => !string.IsNullOrWhiteSpace(review.Text))
+            .GroupBy(static review => $"{review.AuthorName}\n{review.Text}", StringComparer.OrdinalIgnoreCase)
+            .Select(static group => group.First())
+            .Take(3)
             .ToList();
 
         return new NormalizedBusiness(
@@ -6353,11 +6454,13 @@ public sealed class BusinessWebsiteGenerationService
             MapEmbedUri: mapEmbedUri,
             Latitude: latitude,
             Longitude: longitude,
-            Rating: enrichment?.Rating ?? request.Rating,
-            ReviewCount: enrichment?.ReviewCount ?? request.ReviewCount,
+            Rating: enrichment?.Rating ?? publicGoogleEnrichment?.Rating ?? request.Rating,
+            ReviewCount: enrichment?.ReviewCount ?? publicGoogleEnrichment?.ReviewCount ?? request.ReviewCount,
             ReviewsSummary: CleanText(enrichment?.ReviewSummary) ?? CleanText(request.ReviewsSummary),
             ReviewHighlights: reviewHighlights,
-            ReviewsUri: CleanText(enrichment?.ReviewsUri) ?? googleMapsUri,
+            ReviewsUri: CleanText(enrichment?.ReviewsUri) ??
+                        CleanText(publicGoogleEnrichment?.ReviewsUri) ??
+                        googleMapsUri,
             WriteAReviewUri: CleanText(enrichment?.WriteAReviewUri),
             OpeningHours: openingHours,
             Services: services,
@@ -6667,6 +6770,11 @@ public sealed class BusinessWebsiteGenerationService
                 BuildSearchQuery(business.Name, location, CleanText(business.Description))
             };
 
+        queries.AddRange(
+            WebsiteGenerationCreativeDirection
+                .GetImageSearchTopics(business.Category, business.PrimaryType)
+                .Select(topic => BuildSearchQuery(business.Name, location, topic)));
+
         if (IsHospitalityBusiness(business))
         {
             queries.AddRange(
@@ -6694,7 +6802,7 @@ public sealed class BusinessWebsiteGenerationService
         var normalizedQueries = queries
             .Where(static query => !string.IsNullOrWhiteSpace(query))
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(8)
+            .Take(10)
             .ToList();
 
         return normalizedQueries.Count == 0
@@ -8149,7 +8257,7 @@ public sealed class BusinessWebsiteGenerationService
     private static string FormatRating(NormalizedBusiness business)
     {
         return business.Rating is null
-            ? "N/A"
+            ? "—"
             : business.Rating.Value.ToString("0.0", CultureInfo.InvariantCulture) + "/5";
     }
 
@@ -8157,7 +8265,7 @@ public sealed class BusinessWebsiteGenerationService
     {
         return business.ReviewCount is > 0
             ? $"{business.ReviewCount} avis Google"
-            : "Profil local a enrichir";
+            : "Avis vérifiés sur Google";
     }
 
     private static List<string> InferServices(string category, string language)
@@ -8536,7 +8644,6 @@ public sealed class BusinessWebsiteGenerationService
         return System.Security.SecurityElement.Escape(value) ?? string.Empty;
     }
 
-    private sealed record ModelCandidate(string Name, IReadOnlyList<string> ConfigPaths);
 
     private sealed record TemplateDefinition(string Id, string DisplayName, bool IsDark);
 

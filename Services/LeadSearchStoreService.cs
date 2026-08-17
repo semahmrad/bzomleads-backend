@@ -33,6 +33,7 @@ public sealed class LeadSearchStoreService
         string provider,
         string locationQuery,
         string businessType,
+        string countryCode,
         CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync(cancellationToken);
@@ -66,7 +67,9 @@ public sealed class LeadSearchStoreService
             WHERE search_key = $searchKey
             ORDER BY first_seen_utc ASC, name COLLATE NOCASE ASC;
             """;
-        command.Parameters.AddWithValue("$searchKey", BuildSearchKey(provider, locationQuery, businessType));
+        command.Parameters.AddWithValue(
+            "$searchKey",
+            BuildSearchKey(provider, locationQuery, businessType, countryCode));
 
         var items = new List<LeadSearchResultItem>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -100,6 +103,7 @@ public sealed class LeadSearchStoreService
         string provider,
         string locationQuery,
         string businessType,
+        string countryCode,
         IReadOnlyList<LeadSearchResultItem> items,
         CancellationToken cancellationToken = default)
     {
@@ -110,7 +114,7 @@ public sealed class LeadSearchStoreService
 
         await EnsureInitializedAsync(cancellationToken);
 
-        var searchKey = BuildSearchKey(provider, locationQuery, businessType);
+        var searchKey = BuildSearchKey(provider, locationQuery, businessType, countryCode);
         var normalizedLocation = NormalizeLocationKey(locationQuery);
         var normalizedBusinessType = LeadSearchCatalog.NormalizeBusinessType(businessType);
         var nowUtc = DateTimeOffset.UtcNow.ToString("O");
@@ -295,11 +299,16 @@ public sealed class LeadSearchStoreService
         }
     }
 
-    private static string BuildSearchKey(string provider, string locationQuery, string businessType)
+    private static string BuildSearchKey(
+        string provider,
+        string locationQuery,
+        string businessType,
+        string countryCode)
     {
         return string.Join(
             "::",
             LeadSearchCatalog.NormalizeProvider(provider),
+            CountryCatalog.NormalizeCode(countryCode),
             NormalizeLocationKey(locationQuery),
             LeadSearchCatalog.NormalizeBusinessType(businessType));
     }

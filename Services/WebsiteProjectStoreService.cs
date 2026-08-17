@@ -24,7 +24,14 @@ public sealed class WebsiteProjectStoreService
     }
 
     public string GetProjectDirectory(string projectId)
-        => Path.Combine(_projectsRootDirectory, projectId);
+    {
+        if (!Guid.TryParseExact(projectId, "N", out _))
+        {
+            throw new ArgumentException("The website project id is invalid.", nameof(projectId));
+        }
+
+        return Path.Combine(_projectsRootDirectory, projectId);
+    }
 
     public string GetSiteDirectory(string projectId)
         => Path.Combine(GetProjectDirectory(projectId), "site");
@@ -34,6 +41,9 @@ public sealed class WebsiteProjectStoreService
 
     public string GetManifestPath(string projectId)
         => Path.Combine(GetProjectDirectory(projectId), "manifest.json");
+
+    public bool ArchiveExists(string projectId)
+        => File.Exists(GetArchivePath(projectId));
 
     public async Task SaveNewProjectAsync(
         WebsiteProjectManifest manifest,
@@ -133,6 +143,38 @@ public sealed class WebsiteProjectStoreService
         return results
             .OrderByDescending(static manifest => manifest.UpdatedUtc)
             .ToList();
+    }
+
+    public async Task<IReadOnlyList<WebsiteProjectManifest>> GetAllManifestsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var results = new List<WebsiteProjectManifest>();
+
+        foreach (var directory in Directory.EnumerateDirectories(_projectsRootDirectory))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var manifestPath = Path.Combine(directory, "manifest.json");
+            if (!File.Exists(manifestPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                var rawJson = await File.ReadAllTextAsync(manifestPath, cancellationToken);
+                var manifest = JsonSerializer.Deserialize<WebsiteProjectManifest>(rawJson, JsonOptions);
+                if (manifest is not null)
+                {
+                    results.Add(manifest);
+                }
+            }
+            catch
+            {
+                // Ignore malformed legacy manifests.
+            }
+        }
+
+        return results.OrderByDescending(static manifest => manifest.UpdatedUtc).ToList();
     }
 
     public async Task<byte[]?> LoadArchiveAsync(

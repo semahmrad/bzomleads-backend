@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Backend.Models;
 
 namespace Backend.Services;
@@ -31,6 +32,11 @@ public sealed class LeadSearchService
 
         var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
         var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
+        var countryCode = CountryCatalog.NormalizeCode(request.CountryCode);
+        if (CountryCatalog.Find(countryCode) is null)
+        {
+            throw new ArgumentException("A valid account country is required.", nameof(request));
+        }
         var requestedNewResults = NormalizeRequestedNewResults(provider, request.MaxResults);
         var normalizedRequest = request with
         {
@@ -45,6 +51,7 @@ public sealed class LeadSearchService
             provider,
             locationQuery,
             businessType,
+            countryCode,
             cancellationToken);
 
         var existingResults = ApplyWebsiteFilter(storedResults, websiteFilter);
@@ -89,6 +96,7 @@ public sealed class LeadSearchService
             provider,
             locationQuery,
             businessType,
+            countryCode,
             itemsToPersist,
             cancellationToken);
 
@@ -96,6 +104,7 @@ public sealed class LeadSearchService
             provider,
             locationQuery,
             businessType,
+            countryCode,
             cancellationToken);
         var returnedItems = ApplyWebsiteFilter(allStoredResults, websiteFilter);
 
@@ -119,6 +128,133 @@ public sealed class LeadSearchService
             Items: returnedItems);
     }
 
+    public async IAsyncEnumerable<LeadStreamMessage> SearchStreamAsync(
+        LeadSearchRequest request,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var provider = LeadSearchCatalog.NormalizeProvider(request.Provider);
+        var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(locationQuery))
+        {
+            yield return new LeadStreamMessage("error", ErrorMessage: "LocationQuery is required.");
+            yield break;
+        }
+
+        var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
+        var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
+        var countryCode = CountryCatalog.NormalizeCode(request.CountryCode);
+        if (CountryCatalog.Find(countryCode) is null)
+        {
+            yield return new LeadStreamMessage("error", ErrorMessage: "A valid account country is required.");
+            yield break;
+        }
+        var requestedNewResults = NormalizeRequestedNewResults(provider, request.MaxResults);
+        var normalizedRequest = request with
+        {
+            Provider = provider,
+            LocationQuery = locationQuery,
+            BusinessType = businessType,
+            WebsiteFilter = websiteFilter,
+            MaxResults = requestedNewResults
+        };
+
+        var storedResults = await _leadSearchStoreService.GetStoredResultsAsync(
+            provider,
+            locationQuery,
+            businessType,
+            countryCode,
+            cancellationToken);
+
+        var existingResults = ApplyWebsiteFilter(storedResults, websiteFilter);
+        var existingByPlaceId = storedResults.ToDictionary(item => item.PlaceId, StringComparer.OrdinalIgnoreCase);
+
+        var counts = new LeadSearchResponseSummary(
+            Total: existingResults.Count,
+            ExistingResultsCount: existingResults.Count,
+            NewResultsCount: 0,
+            RequestedNewResults: requestedNewResults,
+            WithWebsiteCount: existingResults.Count(item => item.HasWebsite),
+            WithoutWebsiteCount: existingResults.Count(item => !item.HasWebsite),
+            EmailCount: existingResults.Sum(item => item.EmailAddresses.Count));
+
+        yield return new LeadStreamMessage("summary", Summary: counts);
+
+        foreach (var item in existingResults)
+        {
+            yield return new LeadStreamMessage("lead", Lead: item);
+        }
+
+        var fetchBatchSize = ComputeFetchBatchSize(provider, requestedNewResults, storedResults.Count);
+        var providerRequest = normalizedRequest with { MaxResults = fetchBatchSize };
+
+        IAsyncEnumerable<LeadSearchResultItem> freshStream = provider switch
+        {
+            "google_places" => _googlePlacesLeadService.SearchStreamAsync(providerRequest, cancellationToken),
+            _ => _openStreetMapLeadService.SearchStreamAsync(providerRequest, cancellationToken)
+        };
+
+        var selectedNewResults = new List<LeadSearchResultItem>();
+        var persistedPlaceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        await foreach (var item in freshStream.WithCancellation(cancellationToken))
+        {
+            var mergedItem = existingByPlaceId.TryGetValue(item.PlaceId, out var existingItem)
+                ? MergeLeadResult(existingItem, item)
+                : item;
+
+            if (!persistedPlaceIds.Add(mergedItem.PlaceId))
+            {
+                continue;
+            }
+
+            var isExisting = existingByPlaceId.ContainsKey(mergedItem.PlaceId);
+
+            await _leadSearchStoreService.UpsertResultsAsync(
+                provider,
+                locationQuery,
+                businessType,
+                countryCode,
+                new[] { mergedItem },
+                cancellationToken);
+
+            if (isExisting)
+            {
+                yield return new LeadStreamMessage("lead", Lead: mergedItem);
+            }
+            else
+            {
+                if (selectedNewResults.Count < requestedNewResults)
+                {
+                    selectedNewResults.Add(mergedItem);
+                    yield return new LeadStreamMessage("lead", Lead: mergedItem);
+                }
+            }
+        }
+
+        var allStoredResults = await _leadSearchStoreService.GetStoredResultsAsync(
+            provider,
+            locationQuery,
+            businessType,
+            countryCode,
+            cancellationToken);
+        var returnedItems = ApplyWebsiteFilter(allStoredResults, websiteFilter);
+
+        var finalWithWebsiteCount = returnedItems.Count(item => item.HasWebsite);
+        var finalWithoutWebsiteCount = returnedItems.Count - finalWithWebsiteCount;
+        var finalEmailCount = returnedItems.Sum(item => item.EmailAddresses.Count);
+
+        var finalSummary = new LeadSearchResponseSummary(
+            Total: returnedItems.Count,
+            ExistingResultsCount: existingResults.Count,
+            NewResultsCount: selectedNewResults.Count,
+            RequestedNewResults: requestedNewResults,
+            WithWebsiteCount: finalWithWebsiteCount,
+            WithoutWebsiteCount: finalWithoutWebsiteCount,
+            EmailCount: finalEmailCount);
+
+        yield return new LeadStreamMessage("done", Summary: finalSummary, Leads: returnedItems);
+    }
+
     private Task<LeadSearchResponse> SearchProviderAsync(
         LeadSearchRequest request,
         CancellationToken cancellationToken)
@@ -132,7 +268,7 @@ public sealed class LeadSearchService
 
     private static int NormalizeRequestedNewResults(string provider, int? requestedValue)
     {
-        var maxAllowed = provider == "google_places" ? 20 : 100;
+        var maxAllowed = provider == "google_places" ? 20 : 5000;
         return Math.Clamp(requestedValue ?? 10, 1, maxAllowed);
     }
 
@@ -143,8 +279,8 @@ public sealed class LeadSearchService
             return Math.Clamp(Math.Max(requestedNewResults + 5, 20), 1, 20);
         }
 
-        var duplicatePadding = Math.Min(storedCount / 2, 60);
-        return Math.Clamp(requestedNewResults + duplicatePadding + 20, requestedNewResults, 100);
+        var duplicatePadding = Math.Min(storedCount / 2, 100);
+        return Math.Clamp(requestedNewResults + duplicatePadding + 20, requestedNewResults, 5000);
     }
 
     private static List<LeadSearchResultItem> ApplyWebsiteFilter(

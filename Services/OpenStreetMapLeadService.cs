@@ -3,6 +3,8 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
+using System.Runtime.CompilerServices;
 using Backend.Models;
 using Microsoft.Extensions.Options;
 
@@ -40,7 +42,7 @@ public sealed class OpenStreetMapLeadService
         _options = options.Value;
         _googleMapsPublicLeadEnrichmentService = googleMapsPublicLeadEnrichmentService;
         _websiteEmailExtractionService = websiteEmailExtractionService;
-        _httpClient.Timeout = TimeSpan.FromSeconds(Math.Max(5, _options.WebsiteRequestTimeoutSeconds + 10));
+        _httpClient.Timeout = TimeSpan.FromSeconds(120);
 
         if (!_httpClient.DefaultRequestHeaders.UserAgent.Any())
         {
@@ -52,6 +54,42 @@ public sealed class OpenStreetMapLeadService
         LeadSearchRequest request,
         CancellationToken cancellationToken = default)
     {
+        var leads = new List<LeadSearchResultItem>();
+        await foreach (var lead in SearchStreamAsync(request, cancellationToken))
+        {
+            leads.Add(lead);
+        }
+
+        var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
+        var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
+        var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
+        var maxResults = Math.Clamp(request.MaxResults ?? 10, 1, 5000);
+        var extractEmailsFromSites = request.ExtractEmailsFromSites && websiteFilter != "without_website";
+
+        var withWebsiteCount = leads.Count(item => item.HasWebsite);
+        var withoutWebsiteCount = leads.Count - withWebsiteCount;
+        var emailCount = leads.Sum(item => item.EmailAddresses.Count);
+
+        return new LeadSearchResponse(
+            Provider: "open_data",
+            Query: locationQuery,
+            BusinessType: businessType,
+            WebsiteFilter: websiteFilter,
+            ExtractEmailsFromSites: extractEmailsFromSites,
+            Total: leads.Count,
+            ExistingResultsCount: 0,
+            NewResultsCount: leads.Count,
+            RequestedNewResults: maxResults,
+            WithWebsiteCount: withWebsiteCount,
+            WithoutWebsiteCount: withoutWebsiteCount,
+            EmailCount: emailCount,
+            Items: leads);
+    }
+
+    public async IAsyncEnumerable<LeadSearchResultItem> SearchStreamAsync(
+        LeadSearchRequest request,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
         var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(locationQuery))
         {
@@ -60,76 +98,133 @@ public sealed class OpenStreetMapLeadService
 
         var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
         var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
-        var maxResults = Math.Clamp(request.MaxResults ?? 10, 1, 100);
+        var maxResults = Math.Clamp(request.MaxResults ?? 10, 1, 5000);
         var extractEmailsFromSites = request.ExtractEmailsFromSites && websiteFilter != "without_website";
         var useGeminiForEmailExtraction =
             extractEmailsFromSites && request.UseGeminiForEmailExtraction;
 
-        var searchArea = await GeocodeAsync(locationQuery, cancellationToken);
-        var rawItems = await SearchOverpassAsync(
-            searchArea,
-            businessType,
-            Math.Clamp(maxResults * 4, 25, 400),
-            cancellationToken);
+        var searchArea = await GeocodeAsync(locationQuery, request.CountryCode, cancellationToken);
         var searchLatitude = ParseDouble(searchArea.Lat);
         var searchLongitude = ParseDouble(searchArea.Lon);
 
-        var seenPlaceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var semaphore = new SemaphoreSlim(ProcessingConcurrency);
-        var leadTasks = new List<Task<LeadSearchResultItem?>>();
+        var rawItems = await SearchOverpassAsync(
+            searchArea,
+            businessType,
+            CountryCatalog.NormalizeCode(request.CountryCode),
+            Math.Max(5000, maxResults * 10),
+            cancellationToken);
 
-        foreach (var item in rawItems)
+        // Pre-sort by distance to location center
+        var sortedRawItems = rawItems
+            .OrderBy(item => ComputeDistanceMeters(searchLatitude, searchLongitude, item.Center?.Lat ?? item.Lat, item.Center?.Lon ?? item.Lon))
+            .ToList();
+
+        var seenPlaceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var itemsToProcess = new List<OverpassElement>();
+        foreach (var item in sortedRawItems)
         {
             var placeId = $"{item.Type}:{item.Id}";
-            if (!seenPlaceIds.Add(placeId))
+            if (seenPlaceIds.Add(placeId))
             {
-                continue;
+                itemsToProcess.Add(item);
             }
-
-            leadTasks.Add(ProcessElementAsync(
-                item,
-                businessType,
-                websiteFilter,
-                extractEmailsFromSites,
-                useGeminiForEmailExtraction,
-                semaphore,
-                cancellationToken));
         }
 
-        var leads = (await Task.WhenAll(leadTasks))
-            .Where(item => item is not null)
-            .Cast<LeadSearchResultItem>()
-            .ToList();
+        var channel = Channel.CreateUnbounded<LeadSearchResultItem?>(new UnboundedChannelOptions
+        {
+            SingleWriter = false,
+            SingleReader = true
+        });
 
-        var trimmed = leads
-            .OrderBy(item => ComputeDistanceMeters(searchLatitude, searchLongitude, item.Latitude, item.Longitude))
-            .ThenByDescending(item => !string.IsNullOrWhiteSpace(item.Name))
-            .ThenByDescending(item => !string.IsNullOrWhiteSpace(item.PhoneNumber))
-            .ThenByDescending(item => item.HasWebsite)
-            .ThenByDescending(item => item.EmailAddresses.Count)
-            .Take(maxResults)
-            .ToList();
+        var processTask = Task.Run(async () =>
+        {
+            try
+            {
+                using var semaphore = new SemaphoreSlim(ProcessingConcurrency);
+                var producedCount = 0;
 
-        var enriched = await EnrichFinalLeadsAsync(trimmed, cancellationToken);
+                for (var offset = 0;
+                     offset < itemsToProcess.Count && producedCount < maxResults;
+                     offset += ProcessingConcurrency)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var batch = itemsToProcess
+                        .Skip(offset)
+                        .Take(ProcessingConcurrency)
+                        .Select(async item =>
+                        {
+                            try
+                            {
+                                return await ProcessElementAsync(
+                                    item,
+                                    businessType,
+                                    websiteFilter,
+                                    extractEmailsFromSites,
+                                    useGeminiForEmailExtraction,
+                                    semaphore,
+                                    cancellationToken);
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                                throw;
+                            }
+                            catch
+                            {
+                                return null;
+                            }
+                        });
 
-        var withWebsiteCount = enriched.Count(item => item.HasWebsite);
-        var withoutWebsiteCount = enriched.Count - withWebsiteCount;
-        var emailCount = enriched.Sum(item => item.EmailAddresses.Count);
+                    var batchResults = await Task.WhenAll(batch);
+                    foreach (var lead in batchResults)
+                    {
+                        if (lead is null || producedCount >= maxResults)
+                        {
+                            continue;
+                        }
 
-        return new LeadSearchResponse(
-            Provider: "open_data",
-            Query: locationQuery,
-            BusinessType: businessType,
-            WebsiteFilter: websiteFilter,
-            ExtractEmailsFromSites: extractEmailsFromSites,
-            Total: trimmed.Count,
-            ExistingResultsCount: 0,
-            NewResultsCount: enriched.Count,
-            RequestedNewResults: maxResults,
-            WithWebsiteCount: withWebsiteCount,
-            WithoutWebsiteCount: withoutWebsiteCount,
-            EmailCount: emailCount,
-            Items: enriched);
+                        producedCount++;
+                        await channel.Writer.WriteAsync(lead, cancellationToken);
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // The user explicitly stopped the search.
+            }
+            catch
+            {
+                // Individual provider errors are surfaced by the outer search flow.
+            }
+            finally
+            {
+                channel.Writer.Complete();
+            }
+        }, cancellationToken);
+
+        var yieldedCount = 0;
+        var pendingEnrichmentCount = 0;
+
+        while (await channel.Reader.WaitToReadAsync(cancellationToken))
+        {
+            while (channel.Reader.TryRead(out var item))
+            {
+                if (item is not null && yieldedCount < maxResults)
+                {
+                    yieldedCount++;
+                    if (string.IsNullOrWhiteSpace(item.PhoneNumber) &&
+                        item.ContactPhoneNumbers.Count == 0 &&
+                        pendingEnrichmentCount < PublicMapsEnrichmentMaxItems)
+                    {
+                        pendingEnrichmentCount++;
+                        var enrichedList = await EnrichFinalLeadsAsync(new List<LeadSearchResultItem> { item }, cancellationToken);
+                        item = enrichedList.FirstOrDefault() ?? item;
+                    }
+                    yield return item;
+                }
+            }
+        }
+
+        await processTask;
     }
 
     private async Task<LeadSearchResultItem?> ProcessElementAsync(
@@ -224,8 +319,10 @@ public sealed class OpenStreetMapLeadService
         var candidates = items
             .Select((item, index) => new { Item = item, Index = index })
             .Where(entry =>
-                string.IsNullOrWhiteSpace(entry.Item.PhoneNumber) &&
-                entry.Item.ContactPhoneNumbers.Count == 0)
+                (string.IsNullOrWhiteSpace(entry.Item.PhoneNumber) &&
+                 entry.Item.ContactPhoneNumbers.Count == 0) ||
+                entry.Item.Rating is null ||
+                entry.Item.UserRatingCount is null)
             .Take(PublicMapsEnrichmentMaxItems)
             .ToList();
 
@@ -245,6 +342,7 @@ public sealed class OpenStreetMapLeadService
                     candidate.Item.GoogleMapsUri,
                     candidate.Item.Latitude,
                     candidate.Item.Longitude,
+                    candidate.Item.FormattedAddress,
                     cancellationToken);
 
                 return (candidate.Index, Enrichment: enrichment);
@@ -276,16 +374,25 @@ public sealed class OpenStreetMapLeadService
             {
                 PhoneNumber = primaryPhoneNumber,
                 ContactPhoneNumbers = mergedPhones,
-                GoogleMapsUri = FirstNotEmpty(result.Enrichment.GoogleMapsUri, currentItem.GoogleMapsUri)
+                GoogleMapsUri = FirstNotEmpty(result.Enrichment.GoogleMapsUri, currentItem.GoogleMapsUri),
+                Rating = result.Enrichment.Rating ?? currentItem.Rating,
+                UserRatingCount = result.Enrichment.ReviewCount ?? currentItem.UserRatingCount
             };
         }
 
         return items;
     }
 
-    private async Task<NominatimResult> GeocodeAsync(string locationQuery, CancellationToken cancellationToken)
+    private async Task<NominatimResult> GeocodeAsync(
+        string locationQuery,
+        string? countryCode,
+        CancellationToken cancellationToken)
     {
-        var url = $"{NominatimSearchUrl}?format=jsonv2&limit=1&q={Uri.EscapeDataString(locationQuery)}";
+        var normalizedCountryCode = CountryCatalog.NormalizeCode(countryCode).ToLowerInvariant();
+        var countryFilter = string.IsNullOrWhiteSpace(normalizedCountryCode)
+            ? string.Empty
+            : $"&countrycodes={Uri.EscapeDataString(normalizedCountryCode)}";
+        var url = $"{NominatimSearchUrl}?format=jsonv2&limit=1{countryFilter}&q={Uri.EscapeDataString(locationQuery)}";
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.TryAddWithoutValidation("Accept-Language", _options.DefaultLanguageCode);
 
@@ -302,6 +409,7 @@ public sealed class OpenStreetMapLeadService
     private async Task<List<OverpassElement>> SearchOverpassAsync(
         NominatimResult searchArea,
         string businessType,
+        string countryCode,
         int serverLimit,
         CancellationToken cancellationToken)
     {
@@ -313,11 +421,12 @@ public sealed class OpenStreetMapLeadService
         var lon = longitude.ToString("0.000000", CultureInfo.InvariantCulture);
 
         var query = $$"""
-            [out:json][timeout:25];
+            [out:json][timeout:90];
+            area["ISO3166-1"="{{countryCode}}"][admin_level=2]->.assignedCountry;
             (
-              node{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}});
-              way{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}});
-              relation{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}});
+              node{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}})(area.assignedCountry);
+              way{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}})(area.assignedCountry);
+              relation{{filter}}(around:{{radiusMeters}},{{lat}},{{lon}})(area.assignedCountry);
             );
             out center {{serverLimit}};
             """;

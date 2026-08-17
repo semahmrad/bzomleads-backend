@@ -1,5 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Channels;
+using System.Runtime.CompilerServices;
 using Backend.Models;
 using Microsoft.Extensions.Options;
 
@@ -28,50 +30,17 @@ public sealed class GooglePlacesLeadService
         LeadSearchRequest request,
         CancellationToken cancellationToken = default)
     {
-        var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(locationQuery))
+        var leads = new List<LeadSearchResultItem>();
+        await foreach (var lead in SearchStreamAsync(request, cancellationToken))
         {
-            throw new ArgumentException("LocationQuery is required.", nameof(request));
+            leads.Add(lead);
         }
 
+        var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
         var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
         var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
         var maxResults = Math.Clamp(request.MaxResults ?? 10, 1, 20);
         var extractEmailsFromSites = request.ExtractEmailsFromSites && websiteFilter != "without_website";
-        var useGeminiForEmailExtraction =
-            extractEmailsFromSites && request.UseGeminiForEmailExtraction;
-
-        if (string.IsNullOrWhiteSpace(_options.ApiKey))
-        {
-            throw new InvalidOperationException(
-                "Google Places API key is not configured. Set GooglePlaces:ApiKey or GOOGLE_MAPS_API_KEY.");
-        }
-
-        var searchResponse = await SearchPlacesAsync(locationQuery, businessType, maxResults, cancellationToken);
-        var seenPlaceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var semaphore = new SemaphoreSlim(ProcessingConcurrency);
-        var leadTasks = new List<Task<LeadSearchResultItem?>>();
-
-        foreach (var place in searchResponse.Places ?? [])
-        {
-            if (string.IsNullOrWhiteSpace(place.Id) || !seenPlaceIds.Add(place.Id))
-            {
-                continue;
-            }
-            leadTasks.Add(ProcessPlaceAsync(
-                place,
-                businessType,
-                websiteFilter,
-                extractEmailsFromSites,
-                useGeminiForEmailExtraction,
-                semaphore,
-                cancellationToken));
-        }
-
-        var leads = (await Task.WhenAll(leadTasks))
-            .Where(item => item is not null)
-            .Cast<LeadSearchResultItem>()
-            .ToList();
 
         var withWebsiteCount = leads.Count(item => item.HasWebsite);
         var withoutWebsiteCount = leads.Count - withWebsiteCount;
@@ -93,12 +62,113 @@ public sealed class GooglePlacesLeadService
             Items: leads);
     }
 
+    public async IAsyncEnumerable<LeadSearchResultItem> SearchStreamAsync(
+        LeadSearchRequest request,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var locationQuery = (request.LocationQuery ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(locationQuery))
+        {
+            throw new ArgumentException("LocationQuery is required.", nameof(request));
+        }
+
+        var businessType = LeadSearchCatalog.NormalizeBusinessType(request.BusinessType);
+        var websiteFilter = LeadSearchCatalog.NormalizeWebsiteFilter(request.WebsiteFilter);
+        var maxResults = Math.Clamp(request.MaxResults ?? 10, 1, 20);
+        var extractEmailsFromSites = request.ExtractEmailsFromSites && websiteFilter != "without_website";
+        var useGeminiForEmailExtraction =
+            extractEmailsFromSites && request.UseGeminiForEmailExtraction;
+
+        if (string.IsNullOrWhiteSpace(_options.ApiKey))
+        {
+            throw new InvalidOperationException(
+                "Google Places API key is not configured. Set GooglePlaces:ApiKey or GOOGLE_MAPS_API_KEY.");
+        }
+
+        var searchResponse = await SearchPlacesAsync(
+            locationQuery,
+            businessType,
+            maxResults,
+            request.CountryCode,
+            request.CountryName,
+            cancellationToken);
+        var seenPlaceIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var semaphore = new SemaphoreSlim(ProcessingConcurrency);
+
+        var channel = Channel.CreateUnbounded<LeadSearchResultItem?>(new UnboundedChannelOptions
+        {
+            SingleWriter = false,
+            SingleReader = true
+        });
+
+        var processTask = Task.Run(async () =>
+        {
+            try
+            {
+                var activeTasks = new List<Task>();
+                foreach (var place in searchResponse.Places ?? [])
+                {
+                    if (string.IsNullOrWhiteSpace(place.Id) || !seenPlaceIds.Add(place.Id))
+                    {
+                        continue;
+                    }
+
+                    activeTasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var lead = await ProcessPlaceAsync(
+                                place,
+                                businessType,
+                                websiteFilter,
+                                extractEmailsFromSites,
+                                useGeminiForEmailExtraction,
+                                request.CountryCode,
+                                semaphore,
+                                cancellationToken);
+
+                            await channel.Writer.WriteAsync(lead, cancellationToken);
+                        }
+                        catch (Exception)
+                        {
+                            await channel.Writer.WriteAsync(null, cancellationToken);
+                        }
+                    }, cancellationToken));
+                }
+
+                await Task.WhenAll(activeTasks);
+            }
+            catch (Exception)
+            {
+                // Ignore
+            }
+            finally
+            {
+                channel.Writer.Complete();
+            }
+        }, cancellationToken);
+
+        while (await channel.Reader.WaitToReadAsync(cancellationToken))
+        {
+            while (channel.Reader.TryRead(out var item))
+            {
+                if (item is not null)
+                {
+                    yield return item;
+                }
+            }
+        }
+
+        await processTask;
+    }
+
     private async Task<LeadSearchResultItem?> ProcessPlaceAsync(
         PlaceDetailsDto place,
         string businessType,
         string websiteFilter,
         bool extractEmailsFromSites,
         bool useGeminiForEmailExtraction,
+        string? assignedCountryCode,
         SemaphoreSlim semaphore,
         CancellationToken cancellationToken)
     {
@@ -106,6 +176,11 @@ public sealed class GooglePlacesLeadService
         try
         {
             var details = await GetPlaceDetailsAsync(place.Id!, cancellationToken);
+            if (!IsInAssignedCountry(details, assignedCountryCode))
+            {
+                return null;
+            }
+
             var websiteUri = details.WebsiteUri?.Trim();
             var hasWebsite = !string.IsNullOrWhiteSpace(websiteUri);
 
@@ -169,22 +244,25 @@ public sealed class GooglePlacesLeadService
         string locationQuery,
         string businessType,
         int maxResults,
+        string? countryCode,
+        string? countryName,
         CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, SearchUrl)
         {
             Content = JsonContent.Create(new TextSearchRequest(
-                TextQuery: $"{LeadSearchCatalog.GetBusinessLabel(businessType)} in {locationQuery}",
+                TextQuery: $"{LeadSearchCatalog.GetBusinessLabel(businessType)} in {locationQuery}, {countryName}",
                 IncludedType: businessType,
                 StrictTypeFiltering: true,
                 PageSize: maxResults,
-                LanguageCode: _options.DefaultLanguageCode))
+                LanguageCode: _options.DefaultLanguageCode,
+                RegionCode: CountryCatalog.NormalizeCode(countryCode)))
         };
 
         request.Headers.Add("X-Goog-Api-Key", _options.ApiKey);
         request.Headers.Add(
             "X-Goog-FieldMask",
-            "places.id,places.displayName,places.formattedAddress,places.googleMapsUri,places.businessStatus,places.location,places.primaryType,places.rating,places.userRatingCount");
+            "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.googleMapsUri,places.businessStatus,places.location,places.primaryType,places.rating,places.userRatingCount");
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await EnsureSuccessAsync(response, cancellationToken);
@@ -202,7 +280,7 @@ public sealed class GooglePlacesLeadService
         request.Headers.Add("X-Goog-Api-Key", _options.ApiKey);
         request.Headers.Add(
             "X-Goog-FieldMask",
-            "id,displayName,formattedAddress,nationalPhoneNumber,websiteUri,googleMapsUri,businessStatus,location,primaryType,rating,userRatingCount");
+            "id,displayName,formattedAddress,addressComponents,nationalPhoneNumber,websiteUri,googleMapsUri,businessStatus,location,primaryType,rating,userRatingCount");
 
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         await EnsureSuccessAsync(response, cancellationToken);
@@ -222,12 +300,29 @@ public sealed class GooglePlacesLeadService
         throw new InvalidOperationException(
             $"Google Places request failed with status {(int)response.StatusCode}: {content}");
     }
+
+    private static bool IsInAssignedCountry(PlaceDetailsDto place, string? assignedCountryCode)
+    {
+        var normalizedCountryCode = CountryCatalog.NormalizeCode(assignedCountryCode);
+        var resultCountryCode = place.AddressComponents?
+            .FirstOrDefault(component => component.Types?.Any(type =>
+                string.Equals(type, "country", StringComparison.OrdinalIgnoreCase)) == true)
+            ?.ShortText;
+
+        return !string.IsNullOrWhiteSpace(normalizedCountryCode) &&
+               string.Equals(
+                   CountryCatalog.NormalizeCode(resultCountryCode),
+                   normalizedCountryCode,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     private sealed record TextSearchRequest(
         [property: JsonPropertyName("textQuery")] string TextQuery,
         [property: JsonPropertyName("includedType")] string IncludedType,
         [property: JsonPropertyName("strictTypeFiltering")] bool StrictTypeFiltering,
         [property: JsonPropertyName("pageSize")] int PageSize,
-        [property: JsonPropertyName("languageCode")] string LanguageCode);
+        [property: JsonPropertyName("languageCode")] string LanguageCode,
+        [property: JsonPropertyName("regionCode")] string RegionCode);
 
     private sealed class TextSearchResponse
     {
@@ -245,6 +340,9 @@ public sealed class GooglePlacesLeadService
 
         [JsonPropertyName("formattedAddress")]
         public string? FormattedAddress { get; init; }
+
+        [JsonPropertyName("addressComponents")]
+        public List<AddressComponentDto>? AddressComponents { get; init; }
 
         [JsonPropertyName("nationalPhoneNumber")]
         public string? NationalPhoneNumber { get; init; }
@@ -269,6 +367,15 @@ public sealed class GooglePlacesLeadService
 
         [JsonPropertyName("userRatingCount")]
         public int? UserRatingCount { get; init; }
+    }
+
+    private sealed class AddressComponentDto
+    {
+        [JsonPropertyName("shortText")]
+        public string? ShortText { get; init; }
+
+        [JsonPropertyName("types")]
+        public List<string>? Types { get; init; }
     }
 
     private sealed class LocalizedTextDto

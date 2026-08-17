@@ -8,3 +8,5 @@ App_Data/
 *.err.log
 *.stdout.log
 *.stderr.log
+build_errors*.txt
+git_diff.txt

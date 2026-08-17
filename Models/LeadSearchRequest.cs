@@ -7,4 +7,7 @@ public sealed record LeadSearchRequest(
     string? WebsiteFilter,
     bool ExtractEmailsFromSites,
     bool UseGeminiForEmailExtraction,
-    int? MaxResults);
+    int? MaxResults,
+    string? CountryCode = null,
+    string? CountryName = null,
+    string? SearchSessionId = null);

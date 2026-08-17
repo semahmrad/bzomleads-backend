@@ -32,7 +32,17 @@ body {
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 94%, black 1%), var(--color-bg));
   color: var(--color-text);
   font-family: {{BODY_FONT}};
+  letter-spacing: -0.005em;
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
 }
 
 body::before,

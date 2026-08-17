@@ -25,6 +25,7 @@ public sealed class WebsiteProjectService
         IReadOnlyList<WebsiteUploadedAsset> uploadedImages,
         WebsiteUploadedAsset? uploadedLogo,
         string applicationBaseUrl,
+        UserActor actor,
         CancellationToken cancellationToken = default)
     {
         var projectId = Guid.NewGuid().ToString("n", CultureInfo.InvariantCulture);
@@ -72,7 +73,10 @@ public sealed class WebsiteProjectService
             UploadedImageFileNames: build.UploadedImageFileNames,
             UploadedLogoFileName: build.UploadedLogoFileName,
             CreatedUtc: nowUtc,
-            UpdatedUtc: nowUtc);
+            UpdatedUtc: nowUtc,
+            CreatedByUserId: actor.UserId,
+            CreatedByUsername: actor.Username,
+            CreatedByDisplayName: actor.DisplayName);
 
         await _websiteProjectStoreService.SaveNewProjectAsync(
             manifest,
@@ -105,10 +109,12 @@ public sealed class WebsiteProjectService
         IReadOnlyList<WebsiteUploadedAsset> uploadedImages,
         WebsiteUploadedAsset? uploadedLogo,
         string applicationBaseUrl,
+        UserActor actor,
         CancellationToken cancellationToken = default)
     {
         var manifest = await _websiteProjectStoreService.GetManifestAsync(projectId, cancellationToken)
             ?? throw new FileNotFoundException("The generated website project was not found.", projectId);
+        EnsureProjectAccess(manifest, actor);
 
         var build = await _businessWebsiteGenerationService.EditProjectAsync(
             manifest.StateJson,
@@ -161,6 +167,7 @@ public sealed class WebsiteProjectService
 
     public async Task<(byte[] Content, string FileName)?> LoadArchiveAsync(
         string projectId,
+        UserActor actor,
         CancellationToken cancellationToken = default)
     {
         var manifest = await _websiteProjectStoreService.GetManifestAsync(projectId, cancellationToken);
@@ -169,6 +176,8 @@ public sealed class WebsiteProjectService
             return null;
         }
 
+        EnsureProjectAccess(manifest, actor);
+
         var content = await _websiteProjectStoreService.LoadArchiveAsync(projectId, cancellationToken);
         if (content is null)
         {
@@ -176,6 +185,125 @@ public sealed class WebsiteProjectService
         }
 
         return (content, manifest.DownloadFileName);
+    }
+
+    public async Task<IReadOnlyList<WebsiteProjectResponse>> ListOwnedProjectsAsync(
+        UserActor actor,
+        string applicationBaseUrl,
+        CancellationToken cancellationToken = default)
+    {
+        var manifests = await _websiteProjectStoreService.GetAllManifestsAsync(cancellationToken);
+        return manifests
+            .Where(manifest => actor.IsAdmin || string.Equals(
+                    manifest.CreatedByUserId,
+                    actor.UserId,
+                    StringComparison.OrdinalIgnoreCase))
+            .Where(manifest => !string.IsNullOrWhiteSpace(manifest.RepositoryUrl) &&
+                               !string.IsNullOrWhiteSpace(manifest.ProductionUrl))
+            .Select(manifest => BuildResponse(manifest, [], applicationBaseUrl))
+            .ToList();
+    }
+
+    public async Task<IReadOnlyList<AdminWebsiteProjectResponse>> ListAdminProjectsAsync(
+        string applicationBaseUrl,
+        IReadOnlyList<AdminUserResponse> users,
+        CancellationToken cancellationToken = default)
+    {
+        var userLookup = users.ToDictionary(
+            static user => user.Id,
+            StringComparer.OrdinalIgnoreCase);
+        var normalizedBaseUrl = applicationBaseUrl.TrimEnd('/');
+        var manifests = await _websiteProjectStoreService.GetAllManifestsAsync(cancellationToken);
+
+        return manifests.Select(manifest =>
+        {
+            userLookup.TryGetValue(manifest.CreatedByUserId ?? string.Empty, out var commercial);
+            return BuildAdminResponse(manifest, commercial, normalizedBaseUrl);
+        }).ToList();
+    }
+
+    public async Task UpdateClientDeliveryAsync(
+        string projectId,
+        UpdateClientDeliveryRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var manifest = await _websiteProjectStoreService.GetManifestAsync(projectId, cancellationToken)
+            ?? throw new FileNotFoundException("Le projet de site est introuvable.", projectId);
+        var clientName = NormalizeOptionalField(request.ClientName, 120, "Le nom du client");
+        var clientContact = NormalizeOptionalField(request.ClientContact, 180, "Le contact client");
+        var notes = NormalizeOptionalField(request.Notes, 1000, "La note de suivi");
+
+        manifest = manifest with
+        {
+            ClientLinkSent = request.ClientLinkSent,
+            ClientLinkSentUtc = request.ClientLinkSent
+                ? manifest.ClientLinkSentUtc ?? DateTimeOffset.UtcNow
+                : null,
+            ClientName = clientName,
+            ClientContact = clientContact,
+            ClientDeliveryNotes = notes
+        };
+        await _websiteProjectStoreService.SaveManifestAsync(manifest, cancellationToken);
+    }
+
+    private AdminWebsiteProjectResponse BuildAdminResponse(
+        WebsiteProjectManifest manifest,
+        AdminUserResponse? commercial,
+        string normalizedBaseUrl)
+    {
+        var hasArchive = _websiteProjectStoreService.ArchiveExists(manifest.ProjectId);
+        var status = !string.IsNullOrWhiteSpace(manifest.ProductionUrl)
+            ? "Published"
+            : !string.IsNullOrWhiteSpace(manifest.RepositoryUrl)
+                ? "RepositoryReady"
+                : "Generated";
+
+        return new AdminWebsiteProjectResponse(
+                ProjectId: manifest.ProjectId,
+                PlaceId: manifest.PlaceId,
+                BusinessName: manifest.BusinessName,
+                TemplateId: manifest.TemplateId,
+                TemplateName: manifest.TemplateName,
+                DesignConcept: manifest.DesignConcept,
+                ModelUsed: manifest.ModelUsed,
+                Status: status,
+                DownloadUrl: hasArchive
+                    ? $"{normalizedBaseUrl}/api/websites/projects/{manifest.ProjectId}/download"
+                    : null,
+                RepositoryUrl: manifest.RepositoryUrl,
+                ProductionUrl: manifest.ProductionUrl,
+                ChangeSummary: manifest.ChangeSummary,
+                UploadedImageCount: manifest.UploadedImageFileNames.Count,
+                HasCustomLogo: !string.IsNullOrWhiteSpace(manifest.UploadedLogoFileName),
+                HasBeenEdited: !string.IsNullOrWhiteSpace(manifest.ChangeSummary),
+                CreatedUtc: manifest.CreatedUtc,
+                UpdatedUtc: manifest.UpdatedUtc,
+                CreatedByUserId: manifest.CreatedByUserId,
+                CreatedByUsername: manifest.CreatedByUsername ?? commercial?.Username,
+                CreatedByDisplayName: manifest.CreatedByDisplayName ?? commercial?.DisplayName,
+                CommercialCountryCode: commercial?.CountryCode,
+                CommercialCountryName: commercial?.CountryName,
+                CommercialIsActive: commercial?.IsActive,
+                ClientLinkSent: manifest.ClientLinkSent,
+                ClientLinkSentUtc: manifest.ClientLinkSentUtc,
+                ClientName: manifest.ClientName,
+                ClientContact: manifest.ClientContact,
+                ClientDeliveryNotes: manifest.ClientDeliveryNotes,
+                CommercialCountries: commercial?.AllowedCountries ?? []);
+    }
+
+    private static string? NormalizeOptionalField(string? value, int maxLength, string label)
+    {
+        var normalized = value?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return null;
+        }
+        if (normalized.Length > maxLength)
+        {
+            throw new ArgumentException($"{label} ne peut pas depasser {maxLength} caracteres.");
+        }
+        return normalized;
     }
 
     private static WebsiteProjectResponse BuildResponse(
@@ -202,7 +330,24 @@ public sealed class WebsiteProjectService
             ProductionUrl: manifest.ProductionUrl,
             ChangeSummary: manifest.ChangeSummary,
             PrioritizedAssets: prioritizedAssets,
-            UpdatedUtc: manifest.UpdatedUtc);
+            UpdatedUtc: manifest.UpdatedUtc,
+            PlaceId: manifest.PlaceId,
+            CreatedByUserId: manifest.CreatedByUserId,
+            CreatedByDisplayName: manifest.CreatedByDisplayName);
+    }
+
+    private static void EnsureProjectAccess(WebsiteProjectManifest manifest, UserActor actor)
+    {
+        if (actor.IsAdmin)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(manifest.CreatedByUserId) ||
+            !string.Equals(manifest.CreatedByUserId, actor.UserId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new UnauthorizedAccessException("You do not have access to this website project.");
+        }
     }
 
     private static string BuildBusinessKey(

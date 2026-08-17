@@ -12,4 +12,7 @@ public sealed record WebsiteProjectResponse(
     string ProductionUrl,
     string? ChangeSummary,
     IReadOnlyList<string> PrioritizedAssets,
-    DateTimeOffset UpdatedUtc);
+    DateTimeOffset UpdatedUtc,
+    string? PlaceId = null,
+    string? CreatedByUserId = null,
+    string? CreatedByDisplayName = null);

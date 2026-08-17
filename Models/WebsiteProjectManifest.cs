@@ -20,4 +20,12 @@ public sealed record WebsiteProjectManifest(
     IReadOnlyList<string> UploadedImageFileNames,
     string? UploadedLogoFileName,
     DateTimeOffset CreatedUtc,
-    DateTimeOffset UpdatedUtc);
+    DateTimeOffset UpdatedUtc,
+    string? CreatedByUserId = null,
+    string? CreatedByUsername = null,
+    string? CreatedByDisplayName = null,
+    bool ClientLinkSent = false,
+    DateTimeOffset? ClientLinkSentUtc = null,
+    string? ClientName = null,
+    string? ClientContact = null,
+    string? ClientDeliveryNotes = null);
