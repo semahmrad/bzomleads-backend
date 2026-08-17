@@ -1,6 +1,6 @@
-# Exploit Gemeni .NET
+# Lead Radar SaaS - backend
 
-Backend ASP.NET Core pour proxy Gemini.
+Backend ASP.NET Core de l'application Lead Radar.
 
 ## Endpoints
 
@@ -17,23 +17,19 @@ dotnet run
 
 Le serveur demarre par defaut sur `http://localhost:5055`.
 
-## Gemini config
+## Google AI
 
-Le backend attend un fichier local non versionne:
+L'application utilise l'API officielle Google Generative Language. Chaque utilisateur
+configure sa propre cle Google AI Studio lors de sa premiere connexion, puis peut la
+modifier depuis **Mon compte**.
 
-```text
-Config/gemini_request.json
-```
-
-Le repo contient seulement:
-
-```text
-Config/gemini_request.example.json
-```
-
-Copie ce fichier puis remplace les placeholders avec une vraie capture Gemini.
+- modele par defaut : `gemma-3-27b-it` ;
+- cle chiffree par ASP.NET Core Data Protection avant son stockage ;
+- cle jamais renvoyee au navigateur apres son enregistrement ;
+- validation de la cle par Google avant son activation.
 
 ## Notes
 
-- Le vrai `gemini_request.json` est ignore par git pour eviter de publier des cookies ou headers sensibles.
-- CORS est ouvert pour faciliter les appels depuis le frontend Angular local.
+- Les quotas gratuits, modeles disponibles et limites sont geres par Google et peuvent evoluer.
+- En production, configurez des origines CORS explicites et un stockage durable partage
+  pour les cles Data Protection si plusieurs instances du backend sont utilisees.

@@ -1445,20 +1445,6 @@ public sealed class BusinessWebsiteGenerationService
         return null;
     }
 
-    private string? ResolveFirstExistingConfigPath(IReadOnlyList<string> relativePaths)
-    {
-        foreach (var relativePath in relativePaths)
-        {
-            var absolutePath = Path.GetFullPath(Path.Combine(_environment.ContentRootPath, relativePath));
-            if (File.Exists(absolutePath))
-            {
-                return absolutePath;
-            }
-        }
-
-        return null;
-    }
-
     private AiWebsitePayload? TryParseAiPayload(string rawResponse)
     {
         foreach (var candidate in ExtractJsonCandidates(rawResponse))

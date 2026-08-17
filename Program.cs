@@ -125,19 +125,6 @@ builder.Services.AddRateLimiter(options =>
 
 builder.Services.Configure<GeminiProxyOptions>(builder.Configuration.GetSection("GeminiProxy"));
 builder.Services.Configure<GooglePlacesOptions>(builder.Configuration.GetSection("GooglePlaces"));
-builder.Services.PostConfigure<GeminiProxyOptions>(options =>
-{
-    if (string.IsNullOrWhiteSpace(options.RequestConfigPath))
-    {
-        options.RequestConfigPath = Path.Combine("Config", "gemini_request.json");
-    }
-
-    if (!Path.IsPathRooted(options.RequestConfigPath))
-    {
-        options.RequestConfigPath = Path.GetFullPath(
-            Path.Combine(builder.Environment.ContentRootPath, options.RequestConfigPath));
-    }
-});
 
 builder.Services.PostConfigure<GooglePlacesOptions>(options =>
 {
