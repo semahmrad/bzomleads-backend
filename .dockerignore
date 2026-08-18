@@ -1,0 +1,10 @@
+.git
+.github
+.vs
+App_Data
+bin
+obj
+*.log
+*.user
+build_errors*.txt
+git_diff.txt

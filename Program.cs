@@ -10,6 +10,14 @@ using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
+if (int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var renderPort))
+{
+    builder.WebHost.UseUrls($"http://0.0.0.0:{renderPort}");
+}
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
 builder.Services.Configure<SaasOptions>(builder.Configuration.GetSection("Saas"));
 
 var allowedOrigins = builder.Configuration
@@ -152,6 +160,8 @@ builder.Services.AddScoped<WebsiteProjectService>();
 
 var app = builder.Build();
 
+app.UseSwagger();
+app.UseSwaggerUI();
 app.UseCors();
 app.UseRateLimiter();
 app.UseAuthentication();
