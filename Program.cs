@@ -2,9 +2,15 @@ using Backend.Models;
 using Backend.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Cryptography;
 using System.Security.Claims;
+using System.Text;
 using System.Text.Json;
 using System.Threading.RateLimiting;
 
@@ -16,7 +22,45 @@ if (int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var renderPort)
 }
 
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Description = "Saisissez le jeton JWT retourne par POST /api/auth/login.",
+        Name = "Authorization",
+        In = ParameterLocation.Header,
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT"
+    });
+    options.AddSecurityRequirement(document => new OpenApiSecurityRequirement
+    {
+        [new OpenApiSecuritySchemeReference("Bearer", document, null)] = []
+    });
+});
+
+var jwtOptions = builder.Configuration
+    .GetSection(JwtOptions.SectionName)
+    .Get<JwtOptions>() ?? new JwtOptions();
+
+if (string.IsNullOrWhiteSpace(jwtOptions.SigningKey))
+{
+    if (!builder.Environment.IsDevelopment())
+    {
+        throw new InvalidOperationException(
+            "Jwt:SigningKey doit etre configure avec une cle secrete d au moins 32 octets.");
+    }
+
+    jwtOptions.SigningKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(48));
+}
+
+if (Encoding.UTF8.GetByteCount(jwtOptions.SigningKey) < 32)
+{
+    throw new InvalidOperationException("Jwt:SigningKey doit contenir au moins 32 octets.");
+}
+
+jwtOptions.AccessTokenMinutes = Math.Clamp(jwtOptions.AccessTokenMinutes, 5, 720);
+builder.Services.AddSingleton(jwtOptions);
 
 builder.Services.Configure<SaasOptions>(builder.Configuration.GetSection("Saas"));
 
@@ -45,8 +89,22 @@ builder.Services.AddCors(options =>
     });
 });
 
+const string cookieOrBearerScheme = "CookieOrBearer";
+
 builder.Services
-    .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddAuthentication(options =>
+    {
+        options.DefaultScheme = cookieOrBearerScheme;
+        options.DefaultChallengeScheme = cookieOrBearerScheme;
+    })
+    .AddPolicyScheme(cookieOrBearerScheme, cookieOrBearerScheme, options =>
+    {
+        options.ForwardDefaultSelector = context =>
+            context.Request.Headers.Authorization.ToString()
+                .StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                ? JwtBearerDefaults.AuthenticationScheme
+                : CookieAuthenticationDefaults.AuthenticationScheme;
+    })
     .AddCookie(options =>
     {
         options.Cookie.Name = "lead-radar-session";
@@ -108,6 +166,44 @@ builder.Services
             {
                 context.ReplacePrincipal(BuildPrincipal(user));
                 context.ShouldRenew = true;
+            }
+        };
+    })
+    .AddJwtBearer(options =>
+    {
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = jwtOptions.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwtOptions.Audience,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.SigningKey)),
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromMinutes(1),
+            NameClaimType = ClaimTypes.Name,
+            RoleClaimType = ClaimTypes.Role
+        };
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async context =>
+            {
+                var userId = context.Principal?.FindFirstValue(ClaimTypes.NameIdentifier);
+                var sessionVersionClaim = context.Principal?.FindFirstValue("session_version");
+                if (string.IsNullOrWhiteSpace(userId) ||
+                    !int.TryParse(sessionVersionClaim, out var tokenSessionVersion))
+                {
+                    context.Fail("Jeton JWT incomplet.");
+                    return;
+                }
+
+                var saasStore = context.HttpContext.RequestServices.GetRequiredService<SaasStoreService>();
+                var user = await saasStore.FindUserByIdAsync(userId, context.HttpContext.RequestAborted);
+                if (user is null || !user.IsActive || user.SessionVersion != tokenSessionVersion)
+                {
+                    context.Fail("Jeton JWT invalide ou revoque.");
+                }
             }
         };
     });
@@ -220,6 +316,7 @@ app.MapPost("/api/auth/login", async (
     HttpContext httpContext,
     LoginRequest? request,
     SaasStoreService saasStore,
+    JwtOptions configuredJwtOptions,
     CancellationToken cancellationToken) =>
 {
     var username = request?.Username?.Trim();
@@ -240,7 +337,12 @@ app.MapPost("/api/auth/login", async (
 
     await SignInUserAsync(httpContext, user);
     await saasStore.MarkLoginAsync(user.Id, cancellationToken);
-    return Results.Ok(SaasStoreService.ToResponse(user));
+    var accessToken = CreateAccessToken(user, configuredJwtOptions);
+    return Results.Ok(SaasStoreService.ToResponse(user) with
+    {
+        AccessToken = accessToken.Token,
+        AccessTokenExpiresUtc = accessToken.ExpiresUtc
+    });
 }).RequireRateLimiting("login");
 
 app.MapPost("/api/auth/forgot-password", async (
@@ -1071,8 +1173,13 @@ static async Task SignInUserAsync(HttpContext httpContext, AppUserEntity user)
 
 static ClaimsPrincipal BuildPrincipal(AppUserEntity user)
 {
-    var claims = new List<Claim>
-    {
+    var identity = new ClaimsIdentity(BuildClaims(user), CookieAuthenticationDefaults.AuthenticationScheme);
+    return new ClaimsPrincipal(identity);
+}
+
+static List<Claim> BuildClaims(AppUserEntity user)
+    =>
+    [
         new(ClaimTypes.NameIdentifier, user.Id),
         new(ClaimTypes.Name, user.Username),
         new(ClaimTypes.Role, user.Role),
@@ -1082,9 +1189,26 @@ static ClaimsPrincipal BuildPrincipal(AppUserEntity user)
         new("country_codes", string.IsNullOrWhiteSpace(user.AssignedCountryCodes) ? user.CountryCode : user.AssignedCountryCodes),
         new("must_change_password", user.MustChangePassword ? "true" : "false"),
         new("session_version", user.SessionVersion.ToString())
-    };
-    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
-    return new ClaimsPrincipal(identity);
+    ];
+
+static (string Token, DateTimeOffset ExpiresUtc) CreateAccessToken(
+    AppUserEntity user,
+    JwtOptions options)
+{
+    var now = DateTimeOffset.UtcNow;
+    var expiresUtc = now.AddMinutes(options.AccessTokenMinutes);
+    var credentials = new SigningCredentials(
+        new SymmetricSecurityKey(Encoding.UTF8.GetBytes(options.SigningKey)),
+        SecurityAlgorithms.HmacSha256);
+    var token = new JwtSecurityToken(
+        issuer: options.Issuer,
+        audience: options.Audience,
+        claims: BuildClaims(user),
+        notBefore: now.UtcDateTime,
+        expires: expiresUtc.UtcDateTime,
+        signingCredentials: credentials);
+
+    return (new JwtSecurityTokenHandler().WriteToken(token), expiresUtc);
 }
 
 static UserActor GetUserActor(ClaimsPrincipal principal)

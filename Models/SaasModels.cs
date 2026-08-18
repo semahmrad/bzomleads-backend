@@ -29,7 +29,9 @@ public sealed record AuthUserResponse(
     string CountryName,
     bool MustChangePassword,
     IReadOnlyList<CountryOptionResponse> AllowedCountries,
-    bool AiConfigured);
+    bool AiConfigured,
+    string? AccessToken = null,
+    DateTimeOffset? AccessTokenExpiresUtc = null);
 
 public sealed record AdminUserResponse(
     string Id,
