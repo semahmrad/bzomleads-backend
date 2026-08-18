@@ -81,6 +81,15 @@ builder.Services
                 return;
             }
 
+            var sessionVersionClaim = context.Principal?.FindFirstValue("session_version");
+            if (int.TryParse(sessionVersionClaim, out var cookieSessionVersion) &&
+                cookieSessionVersion != user.SessionVersion)
+            {
+                context.RejectPrincipal();
+                await context.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                return;
+            }
+
             var claimsChanged =
                 !string.Equals(context.Principal?.FindFirstValue(ClaimTypes.Name), user.Username, StringComparison.Ordinal) ||
                 !string.Equals(context.Principal?.FindFirstValue("display_name"), user.DisplayName, StringComparison.Ordinal) ||
@@ -89,6 +98,10 @@ builder.Services
                 !string.Equals(
                     context.Principal?.FindFirstValue("must_change_password"),
                     user.MustChangePassword ? "true" : "false",
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    sessionVersionClaim,
+                    user.SessionVersion.ToString(),
                     StringComparison.Ordinal);
 
             if (claimsChanged)
@@ -129,6 +142,16 @@ builder.Services.AddRateLimiter(options =>
                 QueueLimit = 0,
                 AutoReplenishment = true
             }));
+    options.AddPolicy("password-recovery", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            static _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 3,
+                Window = TimeSpan.FromMinutes(15),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            }));
 });
 
 builder.Services.Configure<GeminiProxyOptions>(builder.Configuration.GetSection("GeminiProxy"));
@@ -156,6 +179,7 @@ builder.Services.AddSingleton<SearchCancellationRegistry>();
 builder.Services.AddSingleton<WebsiteProjectStoreService>();
 builder.Services.AddScoped<LeadSearchService>();
 builder.Services.AddScoped<SmtpCampaignService>();
+builder.Services.AddScoped<AdminPasswordRecoveryService>();
 builder.Services.AddScoped<WebsiteProjectService>();
 
 var app = builder.Build();
@@ -175,6 +199,8 @@ app.MapGet("/", () => Results.Ok(new
     endpoints = new[]
     {
         "POST /api/auth/login",
+        "POST /api/auth/forgot-password (Admin only)",
+        "POST /api/auth/reset-admin-password (Admin only)",
         "GET /api/auth/me",
         "POST /api/auth/change-password",
         "GET|POST /api/admin/users (Admin)",
@@ -216,6 +242,46 @@ app.MapPost("/api/auth/login", async (
     await saasStore.MarkLoginAsync(user.Id, cancellationToken);
     return Results.Ok(SaasStoreService.ToResponse(user));
 }).RequireRateLimiting("login");
+
+app.MapPost("/api/auth/forgot-password", async (
+    ForgotAdminPasswordRequest? request,
+    AdminPasswordRecoveryService recoveryService,
+    ILogger<AdminPasswordRecoveryService> logger,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        await recoveryService.RequestResetAsync(request?.Username, cancellationToken);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        logger.LogWarning(ex, "Administrator password recovery email could not be sent.");
+    }
+
+    return Results.Ok(new
+    {
+        message = "Si ce nom correspond au compte administrateur et si Gmail est configure, un lien vient d etre envoye a l adresse de recuperation."
+    });
+}).RequireRateLimiting("password-recovery");
+
+app.MapPost("/api/auth/reset-admin-password", async (
+    ResetAdminPasswordRequest? request,
+    AdminPasswordRecoveryService recoveryService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        await recoveryService.ResetPasswordAsync(
+            request?.Token,
+            request?.NewPassword,
+            cancellationToken);
+        return Results.Ok(new { message = "Mot de passe administrateur modifie. Tu peux maintenant te connecter." });
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+}).RequireRateLimiting("password-recovery");
 
 app.MapGet("/api/auth/me", async (
     HttpContext httpContext,
@@ -261,12 +327,11 @@ app.MapPost("/api/auth/change-password", async (
 
     try
     {
-        await saasStore.ChangePasswordAsync(
+        var updatedUser = await saasStore.ChangePasswordAsync(
             user,
             request?.CurrentPassword ?? string.Empty,
             request?.NewPassword ?? string.Empty,
             cancellationToken);
-        var updatedUser = user with { MustChangePassword = false };
         await SignInUserAsync(httpContext, updatedUser);
         return Results.Ok(SaasStoreService.ToResponse(updatedUser));
     }
@@ -336,6 +401,55 @@ app.MapPut("/api/account/ai-settings", async (
         return Results.BadRequest(new { error = "Impossible de verifier la cle avec Google AI Studio." });
     }
 }).RequireAuthorization("SaasUser");
+
+app.MapGet("/api/admin/security-settings", async (
+    SaasStoreService saasStore,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await saasStore.GetAdminRecoverySettingsAsync(cancellationToken);
+    return Results.Ok(new AdminRecoverySettingsResponse(
+        settings.RecoveryEmail,
+        settings.SmtpUsername,
+        !string.IsNullOrWhiteSpace(settings.SmtpAppPassword),
+        "smtp.gmail.com",
+        587));
+}).RequireAuthorization("AdminOnly");
+
+app.MapPut("/api/admin/security-settings", async (
+    UpdateAdminRecoverySettingsRequest request,
+    SaasStoreService saasStore,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var settings = await saasStore.SaveAdminRecoverySettingsAsync(request, cancellationToken);
+        return Results.Ok(new AdminRecoverySettingsResponse(
+            settings.RecoveryEmail,
+            settings.SmtpUsername,
+            !string.IsNullOrWhiteSpace(settings.SmtpAppPassword),
+            "smtp.gmail.com",
+            587));
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+}).RequireAuthorization("AdminOnly");
+
+app.MapPost("/api/admin/security-settings/test-email", async (
+    AdminPasswordRecoveryService recoveryService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        await recoveryService.SendTestEmailAsync(cancellationToken);
+        return Results.Ok(new { message = "Email de test envoye a l adresse de recuperation." });
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+}).RequireAuthorization("AdminOnly");
 
 app.MapGet("/api/admin/users", async (
     SaasStoreService saasStore,
@@ -966,7 +1080,8 @@ static ClaimsPrincipal BuildPrincipal(AppUserEntity user)
         new("country_code", user.CountryCode),
         new("country_name", user.CountryName),
         new("country_codes", string.IsNullOrWhiteSpace(user.AssignedCountryCodes) ? user.CountryCode : user.AssignedCountryCodes),
-        new("must_change_password", user.MustChangePassword ? "true" : "false")
+        new("must_change_password", user.MustChangePassword ? "true" : "false"),
+        new("session_version", user.SessionVersion.ToString())
     };
     var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
     return new ClaimsPrincipal(identity);

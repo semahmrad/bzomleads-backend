@@ -89,4 +89,5 @@ internal sealed record AppUserEntity(
     string? CreatedByUserId,
     DateTimeOffset? LastLoginUtc,
     string AssignedCountryCodes = "",
-    bool AiConfigured = false);
+    bool AiConfigured = false,
+    int SessionVersion = 0);

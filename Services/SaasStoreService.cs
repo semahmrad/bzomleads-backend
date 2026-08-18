@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Net.Mail;
 using Backend.Models;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.DataProtection;
@@ -19,6 +20,7 @@ public sealed class SaasStoreService
     private readonly ILogger<SaasStoreService> _logger;
     private readonly PasswordHasher<AppUserEntity> _passwordHasher = new();
     private readonly IDataProtector _aiKeyProtector;
+    private readonly IDataProtector _smtpPasswordProtector;
     private readonly SemaphoreSlim _initializationLock = new(1, 1);
     private volatile bool _initialized;
 
@@ -39,6 +41,7 @@ public sealed class SaasStoreService
         }.ToString();
         _options = options.Value;
         _aiKeyProtector = dataProtectionProvider.CreateProtector("LeadRadar.UserGoogleAiApiKey.v1");
+        _smtpPasswordProtector = dataProtectionProvider.CreateProtector("LeadRadar.AdminGmailSmtpPassword.v1");
         _logger = logger;
     }
 
@@ -76,7 +79,8 @@ public sealed class SaasStoreService
                   created_utc TEXT NOT NULL,
                   created_by_user_id TEXT NULL,
                   last_login_utc TEXT NULL,
-                  assigned_country_codes TEXT NULL
+                  assigned_country_codes TEXT NULL,
+                  session_version INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS user_activity (
@@ -101,9 +105,32 @@ public sealed class SaasStoreService
                   updated_utc TEXT NOT NULL,
                   FOREIGN KEY (user_id) REFERENCES app_users(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS admin_recovery_settings (
+                  id INTEGER PRIMARY KEY CHECK (id = 1),
+                  recovery_email TEXT NOT NULL,
+                  smtp_username TEXT NOT NULL,
+                  smtp_password_protected TEXT NULL,
+                  updated_utc TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                  id TEXT PRIMARY KEY,
+                  user_id TEXT NOT NULL,
+                  token_hash TEXT NOT NULL UNIQUE,
+                  expires_utc TEXT NOT NULL,
+                  consumed_utc TEXT NULL,
+                  created_utc TEXT NOT NULL,
+                  FOREIGN KEY (user_id) REFERENCES app_users(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_password_reset_token_hash
+                  ON password_reset_tokens (token_hash);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
             await EnsureAssignedCountryCodesColumnAsync(connection, cancellationToken);
+            await EnsureSessionVersionColumnAsync(connection, cancellationToken);
+            await EnsureAdminRecoverySettingsAsync(connection, cancellationToken);
 
             _initialized = true;
         }
@@ -186,7 +213,7 @@ public sealed class SaasStoreService
         return user;
     }
 
-    internal async Task ChangePasswordAsync(
+    internal async Task<AppUserEntity> ChangePasswordAsync(
         AppUserEntity user,
         string currentPassword,
         string newPassword,
@@ -203,7 +230,11 @@ public sealed class SaasStoreService
             throw new ArgumentException("Le nouveau mot de passe doit etre different du mot de passe actuel.");
         }
 
-        var updatedUser = user with { MustChangePassword = false };
+        var updatedUser = user with
+        {
+            MustChangePassword = false,
+            SessionVersion = user.SessionVersion + 1
+        };
         var passwordHash = _passwordHasher.HashPassword(updatedUser, newPassword);
 
         await using var connection = new SqliteConnection(_connectionString);
@@ -213,12 +244,14 @@ public sealed class SaasStoreService
             """
             UPDATE app_users
             SET password_hash = $passwordHash,
-                must_change_password = 0
+                must_change_password = 0,
+                session_version = session_version + 1
             WHERE id = $userId;
             """;
         command.Parameters.AddWithValue("$passwordHash", passwordHash);
         command.Parameters.AddWithValue("$userId", user.Id);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        return updatedUser with { PasswordHash = passwordHash };
     }
 
     internal async Task<AppUserEntity> UpdateCommercialAsync(
@@ -292,7 +325,11 @@ public sealed class SaasStoreService
         EnsureCommercial(user);
         ValidatePassword(newPassword);
 
-        var updatedUser = user with { MustChangePassword = true };
+        var updatedUser = user with
+        {
+            MustChangePassword = true,
+            SessionVersion = user.SessionVersion + 1
+        };
         var passwordHash = _passwordHasher.HashPassword(updatedUser, newPassword);
 
         await using var connection = new SqliteConnection(_connectionString);
@@ -302,14 +339,15 @@ public sealed class SaasStoreService
             """
             UPDATE app_users
             SET password_hash = $passwordHash,
-                must_change_password = 1
+                must_change_password = 1,
+                session_version = session_version + 1
             WHERE id = $userId AND role = $role;
             """;
         command.Parameters.AddWithValue("$passwordHash", passwordHash);
         command.Parameters.AddWithValue("$userId", user.Id);
         command.Parameters.AddWithValue("$role", AppRoles.User);
         await command.ExecuteNonQueryAsync(cancellationToken);
-        return updatedUser;
+        return updatedUser with { PasswordHash = passwordHash };
     }
 
     public async Task MarkLoginAsync(string userId, CancellationToken cancellationToken = default)
@@ -392,6 +430,242 @@ public sealed class SaasStoreService
 
     internal static string MaskApiKey(string apiKey)
         => apiKey.Length <= 8 ? "••••••••" : $"••••••••••••{apiKey[^4..]}";
+
+    internal async Task<AdminRecoverySettings> GetAdminRecoverySettingsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT recovery_email, smtp_username, smtp_password_protected, updated_utc FROM admin_recovery_settings WHERE id = 1;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            throw new InvalidOperationException("La recuperation administrateur n est pas configuree.");
+        }
+
+        string? smtpPassword = null;
+        if (!reader.IsDBNull(2))
+        {
+            try
+            {
+                smtpPassword = _smtpPasswordProtector.Unprotect(reader.GetString(2));
+            }
+            catch (CryptographicException ex)
+            {
+                _logger.LogWarning(ex, "Unable to decrypt the administrator Gmail SMTP password.");
+            }
+        }
+
+        return new AdminRecoverySettings(
+            reader.GetString(0),
+            reader.GetString(1),
+            smtpPassword,
+            DateTimeOffset.Parse(reader.GetString(3)));
+    }
+
+    internal async Task<AdminRecoverySettings> SaveAdminRecoverySettingsAsync(
+        UpdateAdminRecoverySettingsRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        var recoveryEmail = ValidateEmail(request.RecoveryEmail, "L adresse de recuperation");
+        var smtpUsername = ValidateEmail(request.SmtpUsername, "L identifiant Gmail SMTP");
+        var existing = await GetAdminRecoverySettingsAsync(cancellationToken);
+        var normalizedPassword = string.IsNullOrWhiteSpace(request.SmtpAppPassword)
+            ? existing.SmtpAppPassword
+            : string.Concat(request.SmtpAppPassword.Where(static character => !char.IsWhiteSpace(character)));
+        if (normalizedPassword is { Length: > 0 } && normalizedPassword.Length is < 8 or > 256)
+        {
+            throw new ArgumentException("Le mot de passe d application Gmail semble invalide.");
+        }
+
+        var protectedPassword = string.IsNullOrWhiteSpace(normalizedPassword)
+            ? null
+            : _smtpPasswordProtector.Protect(normalizedPassword);
+        var nowUtc = DateTimeOffset.UtcNow;
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE admin_recovery_settings
+            SET recovery_email = $recoveryEmail,
+                smtp_username = $smtpUsername,
+                smtp_password_protected = $smtpPasswordProtected,
+                updated_utc = $updatedUtc
+            WHERE id = 1;
+            """;
+        command.Parameters.AddWithValue("$recoveryEmail", recoveryEmail);
+        command.Parameters.AddWithValue("$smtpUsername", smtpUsername);
+        command.Parameters.AddWithValue(
+            "$smtpPasswordProtected",
+            protectedPassword is null ? DBNull.Value : protectedPassword);
+        command.Parameters.AddWithValue("$updatedUtc", nowUtc.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        return new AdminRecoverySettings(recoveryEmail, smtpUsername, normalizedPassword, nowUtc);
+    }
+
+    internal async Task CreateAdminPasswordResetTokenAsync(
+        string userId,
+        string tokenHash,
+        DateTimeOffset expiresUtc,
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        var nowUtc = DateTimeOffset.UtcNow;
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        await using (var invalidateCommand = connection.CreateCommand())
+        {
+            invalidateCommand.Transaction = transaction;
+            invalidateCommand.CommandText =
+                "UPDATE password_reset_tokens SET consumed_utc = $nowUtc WHERE user_id = $userId AND consumed_utc IS NULL;";
+            invalidateCommand.Parameters.AddWithValue("$nowUtc", nowUtc.ToString("O"));
+            invalidateCommand.Parameters.AddWithValue("$userId", userId);
+            await invalidateCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var insertCommand = connection.CreateCommand())
+        {
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText =
+                """
+                INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_utc, consumed_utc, created_utc)
+                VALUES ($id, $userId, $tokenHash, $expiresUtc, NULL, $createdUtc);
+                """;
+            insertCommand.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N"));
+            insertCommand.Parameters.AddWithValue("$userId", userId);
+            insertCommand.Parameters.AddWithValue("$tokenHash", tokenHash);
+            insertCommand.Parameters.AddWithValue("$expiresUtc", expiresUtc.ToString("O"));
+            insertCommand.Parameters.AddWithValue("$createdUtc", nowUtc.ToString("O"));
+            await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    internal async Task RevokeAdminPasswordResetTokenAsync(
+        string tokenHash,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "UPDATE password_reset_tokens SET consumed_utc = $nowUtc WHERE token_hash = $tokenHash AND consumed_utc IS NULL;";
+        command.Parameters.AddWithValue("$nowUtc", DateTimeOffset.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$tokenHash", tokenHash);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    internal async Task ResetAdminPasswordWithTokenAsync(
+        string tokenHash,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        ValidatePassword(newPassword);
+        var nowUtc = DateTimeOffset.UtcNow;
+
+        string? userId;
+        DateTimeOffset expiresUtc;
+        await using (var lookupConnection = new SqliteConnection(_connectionString))
+        {
+            await lookupConnection.OpenAsync(cancellationToken);
+            await using var lookupCommand = lookupConnection.CreateCommand();
+            lookupCommand.CommandText =
+                "SELECT user_id, expires_utc FROM password_reset_tokens WHERE token_hash = $tokenHash AND consumed_utc IS NULL LIMIT 1;";
+            lookupCommand.Parameters.AddWithValue("$tokenHash", tokenHash);
+            await using var reader = await lookupCommand.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+            {
+                throw new ArgumentException("Ce lien de recuperation est invalide ou deja utilise.");
+            }
+            userId = reader.GetString(0);
+            expiresUtc = DateTimeOffset.Parse(reader.GetString(1));
+        }
+
+        if (expiresUtc <= nowUtc)
+        {
+            throw new ArgumentException("Ce lien de recuperation a expire. Demande un nouveau lien.");
+        }
+
+        var user = await FindUserByIdAsync(userId, cancellationToken);
+        if (user is null || !user.IsActive || !string.Equals(user.Role, AppRoles.Admin, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Ce lien de recuperation est invalide.");
+        }
+        if (VerifyPassword(user, newPassword) != PasswordVerificationResult.Failed)
+        {
+            throw new ArgumentException("Le nouveau mot de passe doit etre different du mot de passe actuel.");
+        }
+
+        var updatedUser = user with
+        {
+            MustChangePassword = false,
+            SessionVersion = user.SessionVersion + 1
+        };
+        var passwordHash = _passwordHasher.HashPassword(updatedUser, newPassword);
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        await using (var consumeCommand = connection.CreateCommand())
+        {
+            consumeCommand.Transaction = transaction;
+            consumeCommand.CommandText =
+                """
+                UPDATE password_reset_tokens
+                SET consumed_utc = $nowUtc
+                WHERE token_hash = $tokenHash AND consumed_utc IS NULL AND expires_utc > $nowUtc;
+                """;
+            consumeCommand.Parameters.AddWithValue("$nowUtc", nowUtc.ToString("O"));
+            consumeCommand.Parameters.AddWithValue("$tokenHash", tokenHash);
+            if (await consumeCommand.ExecuteNonQueryAsync(cancellationToken) != 1)
+            {
+                throw new ArgumentException("Ce lien de recuperation est invalide ou deja utilise.");
+            }
+        }
+
+        await using (var passwordCommand = connection.CreateCommand())
+        {
+            passwordCommand.Transaction = transaction;
+            passwordCommand.CommandText =
+                """
+                UPDATE app_users
+                SET password_hash = $passwordHash,
+                    must_change_password = 0,
+                    session_version = session_version + 1
+                WHERE id = $userId AND role = $role;
+                """;
+            passwordCommand.Parameters.AddWithValue("$passwordHash", passwordHash);
+            passwordCommand.Parameters.AddWithValue("$userId", user.Id);
+            passwordCommand.Parameters.AddWithValue("$role", AppRoles.Admin);
+            if (await passwordCommand.ExecuteNonQueryAsync(cancellationToken) != 1)
+            {
+                throw new ArgumentException("Le compte administrateur est introuvable.");
+            }
+        }
+
+        await using (var invalidateCommand = connection.CreateCommand())
+        {
+            invalidateCommand.Transaction = transaction;
+            invalidateCommand.CommandText =
+                "UPDATE password_reset_tokens SET consumed_utc = $nowUtc WHERE user_id = $userId AND consumed_utc IS NULL;";
+            invalidateCommand.Parameters.AddWithValue("$nowUtc", nowUtc.ToString("O"));
+            invalidateCommand.Parameters.AddWithValue("$userId", user.Id);
+            await invalidateCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
 
     public async Task<IReadOnlyList<AdminUserResponse>> GetUsersWithStatsAsync(
         CancellationToken cancellationToken = default)
@@ -613,7 +887,8 @@ public sealed class SaasStoreService
             SELECT id, username, display_name, password_hash, role, country_code, country_name,
                    is_active, must_change_password, created_utc, created_by_user_id, last_login_utc,
                    assigned_country_codes,
-                   EXISTS(SELECT 1 FROM user_ai_settings ai WHERE ai.user_id = app_users.id)
+                   EXISTS(SELECT 1 FROM user_ai_settings ai WHERE ai.user_id = app_users.id),
+                   session_version
             FROM app_users
             WHERE {predicate}
             LIMIT 1;
@@ -636,11 +911,11 @@ public sealed class SaasStoreService
                 INSERT INTO app_users (
                   id, username, display_name, password_hash, role, country_code, country_name,
                   is_active, must_change_password, created_utc, created_by_user_id, last_login_utc,
-                  assigned_country_codes
+                  assigned_country_codes, session_version
                 ) VALUES (
                   $id, $username, $displayName, $passwordHash, $role, $countryCode, $countryName,
                   $isActive, $mustChangePassword, $createdUtc, $createdByUserId, $lastLoginUtc,
-                  $assignedCountryCodes
+                  $assignedCountryCodes, $sessionVersion
                 );
                 """;
             command.Parameters.AddWithValue("$id", user.Id);
@@ -656,6 +931,7 @@ public sealed class SaasStoreService
             command.Parameters.AddWithValue("$createdByUserId", user.CreatedByUserId is null ? DBNull.Value : user.CreatedByUserId);
             command.Parameters.AddWithValue("$lastLoginUtc", user.LastLoginUtc is null ? DBNull.Value : user.LastLoginUtc.Value.ToString("O"));
             command.Parameters.AddWithValue("$assignedCountryCodes", string.IsNullOrWhiteSpace(user.AssignedCountryCodes) ? user.CountryCode : user.AssignedCountryCodes);
+            command.Parameters.AddWithValue("$sessionVersion", user.SessionVersion);
             await command.ExecuteNonQueryAsync(cancellationToken);
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
@@ -679,7 +955,8 @@ public sealed class SaasStoreService
             reader.IsDBNull(10) ? null : reader.GetString(10),
             reader.IsDBNull(11) ? null : DateTimeOffset.Parse(reader.GetString(11)),
             reader.IsDBNull(12) ? reader.GetString(5) : reader.GetString(12),
-            reader.GetBoolean(13));
+            reader.GetBoolean(13),
+            reader.GetInt32(14));
 
     private static IReadOnlyList<CountryOptionResponse> NormalizeCountries(
         IReadOnlyList<string>? countryCodes,
@@ -757,6 +1034,75 @@ public sealed class SaasStoreService
         await migrationCommand.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    private static async Task EnsureSessionVersionColumnAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var hasColumn = false;
+        await using (var checkCommand = connection.CreateCommand())
+        {
+            checkCommand.CommandText = "PRAGMA table_info(app_users);";
+            await using var reader = await checkCommand.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                if (string.Equals(reader.GetString(1), "session_version", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasColumn = true;
+                    break;
+                }
+            }
+        }
+
+        if (!hasColumn)
+        {
+            await using var alterCommand = connection.CreateCommand();
+            alterCommand.CommandText =
+                "ALTER TABLE app_users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0;";
+            await alterCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private async Task EnsureAdminRecoverySettingsAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var recoveryEmail = Environment.GetEnvironmentVariable("SAAS_ADMIN_RECOVERY_EMAIL")
+            ?? _options.AdminRecoveryEmail;
+        recoveryEmail = MailAddress.TryCreate(recoveryEmail?.Trim(), out var recoveryAddress)
+            ? recoveryAddress.Address
+            : "Semahmrad@gmail.com";
+        var smtpUsername = Environment.GetEnvironmentVariable("SAAS_SMTP_USERNAME")?.Trim();
+        if (!MailAddress.TryCreate(smtpUsername, out var smtpAddress))
+        {
+            smtpAddress = new MailAddress(recoveryEmail);
+        }
+
+        var smtpAppPassword = Environment.GetEnvironmentVariable("SAAS_GMAIL_APP_PASSWORD");
+        var normalizedPassword = string.IsNullOrWhiteSpace(smtpAppPassword)
+            ? null
+            : string.Concat(smtpAppPassword.Where(static character => !char.IsWhiteSpace(character)));
+        var protectedPassword = string.IsNullOrWhiteSpace(normalizedPassword)
+            ? null
+            : _smtpPasswordProtector.Protect(normalizedPassword);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            INSERT OR IGNORE INTO admin_recovery_settings (
+              id, recovery_email, smtp_username, smtp_password_protected, updated_utc
+            ) VALUES (
+              1, $recoveryEmail, $smtpUsername, $smtpPasswordProtected, $updatedUtc
+            );
+            """;
+        command.Parameters.AddWithValue("$recoveryEmail", recoveryEmail);
+        command.Parameters.AddWithValue("$smtpUsername", smtpAddress.Address);
+        command.Parameters.AddWithValue(
+            "$smtpPasswordProtected",
+            protectedPassword is null ? DBNull.Value : protectedPassword);
+        command.Parameters.AddWithValue("$updatedUtc", DateTimeOffset.UtcNow.ToString("O"));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     private static string NormalizeUsername(string? username)
         => (username ?? string.Empty).Trim().ToLowerInvariant();
 
@@ -784,6 +1130,15 @@ public sealed class SaasStoreService
         {
             throw new ArgumentException("Le nom du commercial doit contenir entre 2 et 100 caracteres.");
         }
+    }
+
+    private static string ValidateEmail(string? value, string label)
+    {
+        if (!MailAddress.TryCreate(value?.Trim(), out var address))
+        {
+            throw new ArgumentException($"{label} est invalide.");
+        }
+        return address.Address;
     }
 
     private static void ValidatePassword(string password)
