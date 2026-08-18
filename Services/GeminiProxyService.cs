@@ -47,17 +47,16 @@ public sealed class GeminiProxyService
         return settings.Model;
     }
 
-    public Task<string> AskAsync(
-        string prompt,
-        string? requestConfigPath,
-        CancellationToken cancellationToken = default)
-        => AskAsync(prompt, cancellationToken);
-
     public async Task ValidateCredentialsAsync(
         string apiKey,
         string model,
         CancellationToken cancellationToken = default)
     {
+        var normalizedKey = (apiKey ?? string.Empty).Trim();
+        if (normalizedKey.Length is < 20 or > 256)
+        {
+            throw new ArgumentException("La cle Google AI Studio semble invalide.");
+        }
         if (!GoogleAiModelCatalog.IsAllowed(model))
         {
             throw new ArgumentException("Le modele IA selectionne n est pas autorise.");
@@ -67,8 +66,9 @@ public sealed class GeminiProxyService
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _options.TimeoutSeconds)));
         using var request = new HttpRequestMessage(
             HttpMethod.Get,
-            $"{ApiBaseUrl}/{Uri.EscapeDataString(model)}?key={Uri.EscapeDataString(apiKey.Trim())}");
-        using var response = await _httpClient.SendAsync(request, timeoutCts.Token);
+            $"{ApiBaseUrl}/{Uri.EscapeDataString(model)}");
+        request.Headers.Add("x-goog-api-key", normalizedKey);
+        using var response = await SendAsync(request, cancellationToken, timeoutCts.Token);
         if (!response.IsSuccessStatusCode)
         {
             throw BuildGoogleApiException(response.StatusCode);
@@ -104,14 +104,12 @@ public sealed class GeminiProxyService
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, _options.TimeoutSeconds)));
         using var request = new HttpRequestMessage(
             HttpMethod.Post,
-            $"{ApiBaseUrl}/{Uri.EscapeDataString(settings.Model)}:generateContent?key={Uri.EscapeDataString(settings.ApiKey)}")
+            $"{ApiBaseUrl}/{Uri.EscapeDataString(settings.Model)}:generateContent")
         {
             Content = new StringContent(payload, Encoding.UTF8, "application/json")
         };
-        using var response = await _httpClient.SendAsync(
-            request,
-            HttpCompletionOption.ResponseHeadersRead,
-            timeoutCts.Token);
+        request.Headers.Add("x-goog-api-key", settings.ApiKey);
+        using var response = await SendAsync(request, cancellationToken, timeoutCts.Token);
         if (!response.IsSuccessStatusCode)
         {
             throw BuildGoogleApiException(response.StatusCode);
@@ -133,6 +131,25 @@ public sealed class GeminiProxyService
         return text.Trim();
     }
 
+    private async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken callerToken,
+        CancellationToken timeoutToken)
+    {
+        try
+        {
+            return await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                timeoutToken);
+        }
+        catch (OperationCanceledException) when (!callerToken.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                "Google AI ne repond pas dans le delai prevu. Reessaie dans quelques instants.");
+        }
+    }
+
     private static Exception BuildGoogleApiException(HttpStatusCode statusCode)
         => statusCode switch
         {
@@ -140,6 +157,8 @@ public sealed class GeminiProxyService
                 "Google AI a refuse la requete. Verifie le modele selectionne."),
             HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => new InvalidOperationException(
                 "La cle Google AI Studio est invalide ou n a pas acces a ce modele."),
+            HttpStatusCode.NotFound => new InvalidOperationException(
+                "Ce modele Google AI n est pas disponible pour cette cle. Choisis un autre modele."),
             HttpStatusCode.TooManyRequests => new InvalidOperationException(
                 "Le quota gratuit Google AI est atteint. Reessaie plus tard ou consulte tes quotas AI Studio."),
             _ => new InvalidOperationException(
