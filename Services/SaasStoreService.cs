@@ -1101,6 +1101,25 @@ public sealed class SaasStoreService
             protectedPassword is null ? DBNull.Value : protectedPassword);
         command.Parameters.AddWithValue("$updatedUtc", DateTimeOffset.UtcNow.ToString("O"));
         await command.ExecuteNonQueryAsync(cancellationToken);
+
+        if (protectedPassword is not null)
+        {
+            await using var bootstrapSecretCommand = connection.CreateCommand();
+            bootstrapSecretCommand.CommandText =
+                """
+                UPDATE admin_recovery_settings
+                SET recovery_email = $recoveryEmail,
+                    smtp_username = $smtpUsername,
+                    smtp_password_protected = $smtpPasswordProtected,
+                    updated_utc = $updatedUtc
+                WHERE id = 1 AND smtp_password_protected IS NULL;
+                """;
+            bootstrapSecretCommand.Parameters.AddWithValue("$recoveryEmail", recoveryEmail);
+            bootstrapSecretCommand.Parameters.AddWithValue("$smtpUsername", smtpAddress.Address);
+            bootstrapSecretCommand.Parameters.AddWithValue("$smtpPasswordProtected", protectedPassword);
+            bootstrapSecretCommand.Parameters.AddWithValue("$updatedUtc", DateTimeOffset.UtcNow.ToString("O"));
+            await bootstrapSecretCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
     }
 
     private static string NormalizeUsername(string? username)
